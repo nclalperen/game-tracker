@@ -34,6 +34,42 @@ type Row = LibraryItem & {
 };
 
 type ViewMode = "cards" | "table";
+type StoreId = "steam" | "epic" | "ea" | "ubisoft" | "gog" | "microsoft" | "battlenet";
+
+type StoreBadgeDetail = {
+  label: string;
+  badge: string;
+};
+
+const STORE_BADGE_DETAILS: Record<StoreId, StoreBadgeDetail> = {
+  steam: { label: "Steam", badge: "Steam" },
+  epic: { label: "Epic Games Store", badge: "Epic" },
+  ea: { label: "EA App", badge: "EA" },
+  ubisoft: { label: "Ubisoft Connect", badge: "Ubi" },
+  gog: { label: "GOG.com", badge: "GOG" },
+  microsoft: { label: "Microsoft Store", badge: "MS" },
+  battlenet: { label: "Battle.net", badge: "B.net" },
+};
+
+function inferStore(info: { identity?: Identity; account?: Account; services?: string[] }): StoreId | null {
+  const { identity, account, services } = info;
+  const haystack = [account?.label ?? "", account?.platform ?? "", ...(services ?? [])]
+    .join(" ")
+    .toLowerCase();
+
+  const has = (needle: string) => haystack.includes(needle);
+
+  if (identity?.appid) return "steam";
+  if (has("steam")) return "steam";
+  if (has("epic") || has("egs")) return "epic";
+  if (has("gog")) return "gog";
+  if (has("ubisoft") || has("uplay") || has("ubi connect") || has("ubisoft+")) return "ubisoft";
+  if (has("battle.net") || has("battlenet") || has("blizzard") || has("bnet")) return "battlenet";
+  if (has("game pass") || has("microsoft") || has("windows store") || has("xbox")) return "microsoft";
+  if (has("ea play") || has("ea app") || has("origin") || /\bea\b/.test(haystack)) return "ea";
+
+  return null;
+}
 const ALL = "ALL" as const;
 
 function parseAppId(input: string): number | null {
@@ -53,7 +89,8 @@ export default function LibraryPage() {
   const [memberFilter, setMemberFilter] = useState<string>(ALL);
   const [statusFilter, setStatusFilter] = useState<string>(ALL);
   const [platformText, setPlatformText] = useState<string>("");
-  // Free‑text search across game titles
+  // Free-text search across game titles
+  const [searchDraft, setSearchDraft] = useState<string>("");
   const [searchText, setSearchText] = useState<string>("");
 
   // data for filters
@@ -72,6 +109,11 @@ export default function LibraryPage() {
 
   // Editor
   const [editing, setEditing] = useState<Row | null>(null);
+
+  useEffect(() => {
+    const handle = window.setTimeout(() => setSearchText(searchDraft.trim()), 150);
+    return () => window.clearTimeout(handle);
+  }, [searchDraft]);
 
   useEffect(() => {
     (async () => {
@@ -175,16 +217,16 @@ export default function LibraryPage() {
 
         <input
           className="input"
-          placeholder="Platform contains…"
+          placeholder="Platform contains..."
           value={platformText}
           onChange={(e) => setPlatformText(e.target.value)}
         />
 
         <input
           className="input"
-          placeholder="Search titles…"
-          value={searchText}
-          onChange={(e) => setSearchText(e.target.value)}
+          placeholder="Search titles..."
+          value={searchDraft}
+          onChange={(e) => setSearchDraft(e.target.value)}
           title="Search games by title"
         />
 
@@ -209,7 +251,7 @@ export default function LibraryPage() {
          * from stretching when there is extra horizontal space and allows
          * additional columns to appear naturally as the window grows.
          */
-        <div className="grid gap-3 [grid-template-columns:repeat(auto-fill,minmax(var(--card-w,280px),var(--card-w,280px)))]">
+        <div className="cards-grid">
           {grouped.map((g) => (
             <CardGroup key={g.identityId} group={g} onEdit={setEditing} />
           ))}
@@ -298,6 +340,12 @@ function CardGroup({
   const best = pickBestEntry(group.entries);
   const pph = pricePerHour(best.priceTRY, best.ttbMedianMainH);
 
+  const platformLabel = id?.platform;
+  const isPc = platformLabel ? platformLabel.toLowerCase().includes("pc") : false;
+  const storeId = isPc ? inferStore({ identity: id, account: best.account, services: best.services }) : null;
+  const storeBadge = storeId ? { id: storeId, ...STORE_BADGE_DETAILS[storeId] } : null;
+  const title = id?.title ?? "Untitled";
+
   // Resolve a currency symbol from the row’s currency code.  Many Steam
   // regions use USD pricing (e.g. Turkey/MENA, Argentina) so we map common
   // ISO codes to symbols.  If we do not recognize the code we fall back to
@@ -323,17 +371,28 @@ function CardGroup({
   const currencySymbol = priceCurrency && currencySymbols[priceCurrency] ? currencySymbols[priceCurrency] : priceCurrency;
 
   return (
-    <div className="card">
+    <div className="card library-card">
       <div className="grid grid-cols-[96px_1fr] gap-3">
         <GameCover identity={id} className="w-24" />
 
         <div>
           <div className="flex items-center justify-between mb-1">
-            <div className="font-semibold">
-              {id?.title}{" "}
-              <span className="badge" title="Platform">
-                {id?.platform}
-              </span>
+            <div className="flex flex-wrap items-center gap-2 font-semibold">
+              <span className="text-base leading-tight">{title}</span>
+              {platformLabel && (
+                <span className="badge" title="Platform">
+                  {platformLabel}
+                </span>
+              )}
+              {storeBadge && (
+                <span
+                  className={`store-badge store-badge--${storeBadge.id}`}
+                  title={storeBadge.label}
+                  aria-label={`${storeBadge.label} store`}
+                >
+                  {storeBadge.badge}
+                </span>
+              )}
             </div>
             <div className="text-xs text-zinc-500">{group.entries.length} item(s)</div>
           </div>
