@@ -116,7 +116,7 @@ export default function SettingsPage() {
       if (result) {
         await db.library.update(row.id, {
           priceTRY: result.price,
-          priceCurrency: result.currency,
+          currencyCode: result.currency,
         } as any);
       }
     }
