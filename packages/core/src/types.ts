@@ -5,9 +5,9 @@ export type Identity = {
   id: string;
   title: string;
   platform?: string;
-  // NEW:
   appid?: number;          // Steam app id
   igdbCoverId?: string;    // IGDB image id like "co123456"
+  ttbSource?: "hltb" | "hltb-cache" | "igdb" | "manual";
 };
 
 export type LibraryItem = {
@@ -17,12 +17,11 @@ export type LibraryItem = {
   memberId?: string;
   status: Status;
   priceTRY?: number;
+  currencyCode?: string;
   acquiredAt?: string;
   services?: string[];
   ocScore?: number;
   ttbMedianMainH?: number;
-  // NEW:
-  ttbSource?: "hltb" | "igdb" | "manual";
 };
 
 

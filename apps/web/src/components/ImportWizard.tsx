@@ -341,7 +341,7 @@ export default function ImportWizard({
 
                 if (accountLabel && !foundByLabel) {
                   const ident = existingIdentities.find((i) => i.id === li.identityId);
-                  const platform: Platform = ident?.platform ?? "PC";
+                  const platform: Platform = (ident?.platform as Platform | undefined) ?? "PC";
                   const newAcc = { id: `a-${crypto.randomUUID()}`, platform, label: accountLabel };
                   toPutAccounts.push(newAcc);
                   accountByLabel.set(accountLabel.trim().toLowerCase(), newAcc);

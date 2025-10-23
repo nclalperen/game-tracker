@@ -8,7 +8,7 @@ import { fetchHLTB, fetchSteamPrice, fetchOpenCriticScore, isTauri } from "@/des
  * integrations, adjust card layout, and choose the Steam region for price
  * fetching.  All preferences are persisted in localStorage and applied on
  * first mount.  Hooks are used exclusively inside the component body to
- * satisfy React’s rules of hooks.
+ * satisfy React's rules of hooks.
  */
 export default function SettingsPage() {
   // Set the card width to a fixed 340px ("Large" size) on mount.  The user can no
@@ -75,6 +75,8 @@ export default function SettingsPage() {
         if (mainMedianHours != null) {
           await db.library.update(row.id, {
             ttbMedianMainH: mainMedianHours,
+          } as any);
+          await db.identities.update(row.identityId, {
             ttbSource: source === "hltb-cache" ? "hltb-cache" : "hltb",
           } as any);
         }
@@ -186,7 +188,7 @@ export default function SettingsPage() {
         </label>
         <label className="flex items-center gap-3">
           <input type="checkbox" checked={igdbOn} onChange={(e) => setIgdbOn(e.target.checked)} />
-          <span>IGDB (TTB & cover id) — mocked until keys</span>
+          <span>IGDB (TTB & cover id) - mocked until keys</span>
         </label>
         <label className="flex items-center gap-3" title={(() => {
           try {

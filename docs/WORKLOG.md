@@ -38,3 +38,4 @@ Local-first desktop and web app to ingest personal game libraries, enrich metada
 - 2025-02-14: Initialized Git, removed redundant `game-tracker/` copy, added worklog template.
 - 2025-02-14: Restored Tailwind styling/cards, added debounced title search, and surfaced store badges in library view.
 - 2025-02-14: Removed legacy `old*` web pages and re-enabled full TypeScript coverage.
+- 2025-02-14: Added Dexie v5 migration (`currencyCode`), moved TTB source tracking onto identities, and refreshed editor/bulk fetch flows.

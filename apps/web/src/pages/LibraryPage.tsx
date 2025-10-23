@@ -25,9 +25,8 @@ type Row = LibraryItem & {
   /** Local extras we persist on the library row (Dexie stores unindexed props fine) */
   ttbMedianMainH?: number | null;
   ocScore?: number | null;
-  ttbSource?: "hltb" | "hltb-cache" | "igdb" | "manual";
-  /** Currency code for the price (e.g. "USD", "EUR").  Undefined when unknown */
-  priceCurrency?: string;
+  /** Currency code for the price (e.g. "USD", "EUR"). Undefined when unknown */
+  currencyCode?: string;
   identity?: Identity;
   member?: Member;
   account?: Account;
@@ -50,6 +49,30 @@ const STORE_BADGE_DETAILS: Record<StoreId, StoreBadgeDetail> = {
   microsoft: { label: "Microsoft Store", badge: "MS" },
   battlenet: { label: "Battle.net", badge: "B.net" },
 };
+
+const CURRENCY_SYMBOLS: Record<string, string> = {
+  USD: "$",
+  EUR: "EUR",
+  GBP: "GBP",
+  RUB: "RUB",
+  ARS: "$",
+  BRL: "R$",
+  JPY: "JPY",
+  AUD: "A$",
+  CAD: "C$",
+  TRY: "TRY",
+  CNY: "CNY",
+  MXN: "$",
+  CLP: "$",
+  KRW: "KRW",
+  INR: "INR",
+};
+
+function formatCurrency(code?: string | null) {
+  if (!code) return "-";
+  const upper = code.toUpperCase();
+  return CURRENCY_SYMBOLS[upper] ?? upper;
+}
 
 function inferStore(info: { identity?: Identity; account?: Account; services?: string[] }): StoreId | null {
   const { identity, account, services } = info;
@@ -281,25 +304,25 @@ export default function LibraryPage() {
             <tbody>
               {filtered.map((row) => (
                 <tr key={row.id}>
-                  <td className="px-2 py-1">{row.identity?.title ?? "—"}</td>
-                  <td className="px-2 py-1">{row.identity?.platform ?? "—"}</td>
+                  <td className="px-2 py-1">{row.identity?.title ?? "-"}</td>
+                  <td className="px-2 py-1">{row.identity?.platform ?? "-"}</td>
                   <td className="px-2 py-1">{row.status}</td>
                   <td className="px-2 py-1">
                     {row.priceTRY != null
-                      ? ((row.priceCurrency?.toUpperCase() ?? "₺") + " " + row.priceTRY)
-                      : "—"}
+                      ? `${formatCurrency(row.currencyCode)} ${row.priceTRY}`
+                      : "-"}
                   </td>
-                  <td className="px-2 py-1">{row.ttbMedianMainH ?? "—"}</td>
+                  <td className="px-2 py-1">{row.ttbMedianMainH ?? "-"}</td>
                   <td className="px-2 py-1">
                     {(() => {
                       const pph = pricePerHour(row.priceTRY, row.ttbMedianMainH);
-                      if (pph == null) return "—";
-                      const sym = row.priceCurrency?.toUpperCase() ?? "₺";
+                      if (pph == null) return "-";
+                      const sym = formatCurrency(row.currencyCode);
                       return `${sym} ${pph}`;
                     })()}
                   </td>
-                  <td className="px-2 py-1">{row.ocScore ?? "—"}</td>
-                  <td className="px-2 py-1">{row.acquiredAt ?? "—"}</td>
+                  <td className="px-2 py-1">{row.ocScore ?? "-"}</td>
+                  <td className="px-2 py-1">{row.acquiredAt ?? "-"}</td>
                   <td className="px-2 py-1">
                     <button className="btn-ghost" onClick={() => setEditing(row)}>
                       Edit
@@ -336,44 +359,22 @@ function CardGroup({
   group: { identityId: string; identity?: Identity; entries: Row[] };
   onEdit: (r: Row) => void;
 }) {
-  const id = group.identity;
+  const identity = group.identity;
   const best = pickBestEntry(group.entries);
   const pph = pricePerHour(best.priceTRY, best.ttbMedianMainH);
 
-  const platformLabel = id?.platform;
+  const platformLabel = identity?.platform;
   const isPc = platformLabel ? platformLabel.toLowerCase().includes("pc") : false;
-  const storeId = isPc ? inferStore({ identity: id, account: best.account, services: best.services }) : null;
+  const storeId = isPc ? inferStore({ identity, account: best.account, services: best.services }) : null;
   const storeBadge = storeId ? { id: storeId, ...STORE_BADGE_DETAILS[storeId] } : null;
-  const title = id?.title ?? "Untitled";
+  const title = identity?.title ?? "Untitled";
 
-  // Resolve a currency symbol from the row’s currency code.  Many Steam
-  // regions use USD pricing (e.g. Turkey/MENA, Argentina) so we map common
-  // ISO codes to symbols.  If we do not recognize the code we fall back to
-  // the raw code (e.g. "ARS" → "ARS").
-  const currencySymbols: Record<string, string> = {
-    USD: "$",
-    EUR: "€",
-    GBP: "£",
-    RUB: "₽",
-    ARS: "$", // Argentine Peso now priced in USD on Steam; use $ symbol
-    BRL: "R$",
-    JPY: "¥",
-    AUD: "A$",
-    CAD: "C$",
-    TRY: "₺",
-    CNY: "¥",
-    MXN: "$",
-    CLP: "$",
-    KRW: "₩",
-    INR: "₹",
-  };
-  const priceCurrency = best.priceCurrency?.toUpperCase();
-  const currencySymbol = priceCurrency && currencySymbols[priceCurrency] ? currencySymbols[priceCurrency] : priceCurrency;
+  const currencyLabel = formatCurrency(best.currencyCode);
 
   return (
     <div className="card library-card">
       <div className="grid grid-cols-[96px_1fr] gap-3">
-        <GameCover identity={id} className="w-24" />
+        <GameCover identity={identity} className="w-24" />
 
         <div>
           <div className="flex items-center justify-between mb-1">
@@ -403,21 +404,21 @@ function CardGroup({
                 Status: {best.status}
               </span>
               <span className="inline-block text-xs rounded bg-zinc-100 px-2 py-0.5">
-                {currencySymbol ?? "₺"}: {best.priceTRY ?? "—"}
+                {currencyLabel}: {best.priceTRY ?? "-"}
               </span>
               <span className="inline-block text-xs rounded bg-zinc-100 px-2 py-0.5">
-                TTB: {best.ttbMedianMainH ?? "—"}h
+                TTB: {best.ttbMedianMainH ?? "-"}h
               </span>
               <span className="inline-block text-xs rounded bg-zinc-100 px-2 py-0.5">
-                {(currencySymbol ?? "₺")}/h: {pph ?? "—"}
+                {currencyLabel}/h: {pph ?? "-"}
               </span>
               <span className="inline-block text-xs rounded bg-zinc-100 px-2 py-0.5">
-                OC: {best.ocScore ?? "—"}
+                OC: {best.ocScore ?? "-"}
               </span>
             </div>
 
             <div className="text-xs text-zinc-500">
-              Account: {best.account?.label || "—"} • Member: {best.member?.name || "Everyone"}
+              Account: {best.account?.label || "-"} | Member: {best.member?.name || "Everyone"}
             </div>
 
             <div className="pt-2">
@@ -432,81 +433,78 @@ function CardGroup({
   );
 }
 
-// preference: Playing > Backlog > Owned > Wishlist > others; otherwise first entry
-function pickBestEntry(entries: Row[]): Row {
-  const order: Status[] = ["Playing", "Backlog", "Owned", "Wishlist", "Beaten", "Abandoned"];
-  const byStatus = new Map(order.map((s, i) => [s, i] as const));
-  return ([...entries].sort((a, b) => {
-    const sa = byStatus.get(a.status) ?? 999;
-    const sb = byStatus.get(b.status) ?? 999;
-    return sa - sb;
-  })[0] || entries[0]);
-}
-
 /** ---------- Editor Modal ---------- */
 function Editor({ row, onClose }: { row: Row | null; onClose: () => void }) {
   const open = !!row;
-  const r = row as Row | null;
+  const current = row ?? null;
 
   const { enabled: igdbOn, fetchMeta } = useIGDB();
   const { fetchScore } = useOpenCritic();
   const { enabled: hltbOn, fetchTTB } = useHLTB();
 
-  // runtime desktop (Tauri) guard
   const isTauri = typeof window !== "undefined" && Boolean((window as any).__TAURI_INTERNALS__);
 
-  const [status, setStatus] = useState<Status>(r?.status ?? "Backlog");
-  // price and currency are separate fields.  price is a number (e.g. 22.99) and
-  // currency is a string like "USD", "EUR", etc.
-  const [price, setPrice] = useState<number>(r?.priceTRY ?? 0);
-  const [currency, setCurrency] = useState<string>(r?.priceCurrency ?? "TRY");
-  const [ttb, setTtb] = useState<number | null>(r?.ttbMedianMainH ?? null);
-  const [score, setScore] = useState<number | null>(r?.ocScore ?? null);
+  const [status, setStatus] = useState<Status>(current?.status ?? "Backlog");
+  const [price, setPrice] = useState<number>(current?.priceTRY ?? 0);
+  const [currency, setCurrency] = useState<string>(current?.currencyCode ?? "TRY");
+  const [ttb, setTtb] = useState<number | null>(current?.ttbMedianMainH ?? null);
+  const [score, setScore] = useState<number | null>(current?.ocScore ?? null);
 
-  // appid helpers
-  const currentAppid = r?.identity?.appid ?? null;
+  const currentAppid = current?.identity?.appid ?? null;
   const [appidInput, setAppidInput] = useState<string>(currentAppid ? String(currentAppid) : "");
 
   const [busyTTB, setBusyTTB] = useState(false);
   const [busyPrice, setBusyPrice] = useState(false);
-  
-  useEffect(() => {
-    if (r) {
-      setStatus(r.status);
-      setPrice(r.priceTRY ?? 0);
-      setCurrency(r.priceCurrency ?? "TRY");
-      setTtb(r.ttbMedianMainH ?? null);
-      setScore(r.ocScore ?? null);
-    }
-  }, [r?.id]);
 
-  // keep it in sync when user opens a different row
+  useEffect(() => {
+    if (current) {
+      setStatus(current.status);
+      setPrice(current.priceTRY ?? 0);
+      setCurrency(current.currencyCode ?? "TRY");
+      setTtb(current.ttbMedianMainH ?? null);
+      setScore(current.ocScore ?? null);
+    }
+  }, [current?.id]);
+
   useEffect(() => {
     setAppidInput(currentAppid ? String(currentAppid) : "");
   }, [currentAppid]);
 
-  if (!open || !r) return null;
+  if (!open || !current) return null;
 
   const ocEnabled = flags.openCriticEnabled || localStorage.getItem("oc_enabled") === "1";
   const ocDisabled = !ocEnabled;
-  const igdbDisabled = !igdbOn;
+
+  const currencyLabel = (code: string | null | undefined) => formatCurrency(code);
+
+  const updateIdentity = async (values: Partial<Identity>) => {
+    if (!current.identity?.id) return;
+    await db.identities.update(current.identity.id, values as any);
+  };
 
   return (
-    <Modal open={open} title={`Edit: ${r.identity?.title || ""}`} onClose={onClose}>
+    <Modal open={open} title={`Edit: ${current.identity?.title || ""}`} onClose={onClose}>
       <form
         className="space-y-3"
         onSubmit={async (e) => {
           e.preventDefault();
-          await db.library.update(r.id, {
+
+          await db.library.update(current.id, {
             status,
             priceTRY: price,
-            priceCurrency: currency,
+            currencyCode: currency,
             ttbMedianMainH: ttb ?? undefined,
             ocScore: score ?? undefined,
-            // When user edits TTB manually we stamp source to "manual"
-            ttbSource:
-              ttb != null ? (r.ttbMedianMainH !== ttb ? "manual" : r.ttbSource) : r.ttbSource,
           } as any);
+
+          let nextSource: Identity["ttbSource"] | undefined = current.identity?.ttbSource;
+          if (ttb == null) {
+            nextSource = undefined;
+          } else if (current.ttbMedianMainH !== ttb) {
+            nextSource = "manual";
+          }
+          await updateIdentity({ ttbSource: nextSource });
+
           onClose();
           location.reload();
         }}
@@ -514,12 +512,8 @@ function Editor({ row, onClose }: { row: Row | null; onClose: () => void }) {
         <div className="grid grid-cols-2 gap-2">
           <div>
             <label className="text-xs text-zinc-500">Status</label>
-            <select
-              className="select"
-              value={status}
-              onChange={(e) => setStatus(e.target.value as Status)}
-            >
-              {["Backlog", "Playing", "Beaten", "Abandoned", "Wishlist", "Owned"].map((s) => (
+            <select className="select" value={status} onChange={(e) => setStatus(e.target.value as Status)}>
+              {(["Backlog", "Playing", "Beaten", "Abandoned", "Wishlist", "Owned"] as Status[]).map((s) => (
                 <option key={s} value={s}>
                   {s}
                 </option>
@@ -528,29 +522,7 @@ function Editor({ row, onClose }: { row: Row | null; onClose: () => void }) {
           </div>
 
           <div>
-            <label className="text-xs text-zinc-500">Price ({(() => {
-              // Map a few common currency codes to symbols.  If we do not
-              // recognize the code we return the uppercase ISO code.
-              const map: Record<string, string> = {
-                USD: "$",
-                EUR: "€",
-                GBP: "£",
-                RUB: "₽",
-                ARS: "$", // Argentine Peso is priced in USD on Steam; show $
-                BRL: "R$",
-                JPY: "¥",
-                AUD: "A$",
-                CAD: "C$",
-                TRY: "₺",
-                CNY: "¥",
-                MXN: "$",
-                CLP: "$",
-                KRW: "₩",
-                INR: "₹",
-              };
-              const cc = currency?.toUpperCase();
-              return (cc && map[cc]) ? map[cc] : cc;
-            })()})</label>
+            <label className="text-xs text-zinc-500">Price ({currencyLabel(currency)})</label>
             <input
               className="input"
               type="number"
@@ -580,8 +552,34 @@ function Editor({ row, onClose }: { row: Row | null; onClose: () => void }) {
           </div>
         </div>
 
-        {/* Integration buttons */}
         <div className="grid grid-cols-2 gap-2">
+          <button
+            type="button"
+            className="btn"
+            disabled={!igdbOn}
+            title={!igdbOn ? "IGDB integration is disabled" : "Fetch IGDB metadata (mock)"}
+            onClick={async () => {
+              try {
+                if (!igdbOn) return;
+                const title = current.identity?.title || "";
+                if (!title) return alert("Missing title");
+                const meta = await fetchMeta(title);
+                if (meta.ttbMedianMainH != null) {
+                  setTtb(meta.ttbMedianMainH);
+                  await db.library.update(current.id, { ttbMedianMainH: meta.ttbMedianMainH } as any);
+                  await updateIdentity({ ttbSource: "igdb" });
+                }
+                if (meta.igdbCoverId) {
+                  await updateIdentity({ igdbCoverId: meta.igdbCoverId });
+                }
+              } catch (err: any) {
+                alert(err?.message || String(err));
+              }
+            }}
+          >
+            Fetch IGDB
+          </button>
+
           <button
             type="button"
             className="btn"
@@ -589,48 +587,41 @@ function Editor({ row, onClose }: { row: Row | null; onClose: () => void }) {
             title={ocDisabled ? "OpenCritic is disabled (feature flag)" : "Fetch OpenCritic score"}
             onClick={async () => {
               try {
-                const title = r.identity?.title || "";
+                const title = current.identity?.title || "";
                 if (!title) return alert("Missing title");
                 const res = await fetchScore(title);
                 setScore(res?.ocScore ?? null);
-              } catch (e: any) {
-                alert(e?.message || String(e));
+              } catch (err: any) {
+                alert(err?.message || String(err));
               }
             }}
           >
             Fetch OpenCritic
           </button>
+        </div>
 
+        <div className="grid grid-cols-2 gap-2">
           <button
             type="button"
             className="btn"
             disabled={!hltbOn || busyTTB}
-            title={!hltbOn ? "Desktop-only (Tauri) in this MVP" : "Fetch HowLongToBeat (Main median)"}
+            title={!hltbOn ? "Desktop-only (Tauri)" : "Fetch HowLongToBeat (main median)"}
             onClick={async () => {
               try {
                 setBusyTTB(true);
-                const title = r.identity?.title || "";
+                const title = current.identity?.title || "";
                 if (!title) return alert("Missing title");
-                const meta = await fetchTTB(title); // { mainMedianHours, source }
+                const meta = await fetchTTB(title);
                 if (meta.mainMedianHours != null) {
                   setTtb(meta.mainMedianHours);
-                  // Map the source returned from the hook to our internal value.  The hook
-                  // returns "hltb", "hltb-cache" or "html"; treat HTML fallback
-                  // as "hltb" in the DB.
-                  const src = (() => {
-                    if (meta.source === "hltb-cache") return "hltb-cache" as const;
-                    if (meta.source === "hltb") return "hltb" as const;
-                    return "hltb" as const;
-                  })();
-                  await db.library.update(r.id, {
-                    ttbMedianMainH: meta.mainMedianHours,
-                    ttbSource: src,
-                  } as any);
+                  await db.library.update(current.id, { ttbMedianMainH: meta.mainMedianHours } as any);
+                  const src = meta.source === "hltb-cache" ? "hltb-cache" : "hltb";
+                  await updateIdentity({ ttbSource: src });
                 } else {
                   alert("No HLTB result.");
                 }
-              } catch (e: any) {
-                alert(e?.message || String(e));
+              } catch (err: any) {
+                alert(err?.message || String(err));
               } finally {
                 setBusyTTB(false);
               }
@@ -638,9 +629,10 @@ function Editor({ row, onClose }: { row: Row | null; onClose: () => void }) {
           >
             Fetch HLTB / TTB
           </button>
+
+          <div />
         </div>
 
-        {/* Desktop-only price fetch */}
         <div className="grid grid-cols-2 gap-2">
           <button
             type="button"
@@ -660,7 +652,6 @@ function Editor({ row, onClose }: { row: Row | null; onClose: () => void }) {
               try {
                 if (!currentAppid) return alert("This game has no Steam appid.");
                 setBusyPrice(true);
-                // Region preference from settings; fallback to a list of regions if price isn't available.
                 const prefs = [
                   (localStorage.getItem("steam_cc") || "us").toLowerCase(),
                   "us",
@@ -676,7 +667,7 @@ function Editor({ row, onClose }: { row: Row | null; onClose: () => void }) {
                 for (const region of prefs) {
                   try {
                     result = await fetchSteamPrice(currentAppid, region);
-                  } catch (_e) {
+                  } catch (_err) {
                     result = null;
                   }
                   if (result) break;
@@ -685,12 +676,11 @@ function Editor({ row, onClose }: { row: Row | null; onClose: () => void }) {
                   alert("No price available for this or fallback regions.");
                   return;
                 }
-                const { price: p, currency: cur } = result;
-                setPrice(p);
-                setCurrency(cur);
-                await db.library.update(r.id, { priceTRY: p, priceCurrency: cur } as any);
-              } catch (e: any) {
-                alert(e?.message || String(e));
+                setPrice(result.price);
+                setCurrency(result.currency);
+                await db.library.update(current.id, { priceTRY: result.price, currencyCode: result.currency } as any);
+              } catch (err: any) {
+                alert(err?.message || String(err));
               } finally {
                 setBusyPrice(false);
               }
@@ -711,22 +701,21 @@ function Editor({ row, onClose }: { row: Row | null; onClose: () => void }) {
               type="button"
               className="btn-ghost"
               onClick={async () => {
-                const id = parseAppId(appidInput);
-                if (!id) return alert("Enter a valid appid or Steam app URL.");
-                if (!r?.identity?.id) return alert("Missing identity.");
-                await db.identities.update(r.identity.id, { appid: id } as any);
+                const parsed = parseAppId(appidInput);
+                if (!parsed) return alert("Enter a valid appid or Steam app URL.");
+                if (!current.identity?.id) return alert("Missing identity.");
+                await db.identities.update(current.identity.id, { appid: parsed } as any);
                 setAppidInput("");
-                alert(`Saved appid ${id}. You can now fetch price.`);
+                alert(`Saved appid ${parsed}. You can now fetch price.`);
                 location.reload();
               }}
-              disabled={!appidInput || String(currentAppid||"") === appidInput.trim()}
+              disabled={!appidInput || String(currentAppid ?? "") === appidInput.trim()}
             >
               Set appid
             </button>
           </div>
         </div>
 
-        {/* Footer actions */}
         <div className="pt-2 flex items-center justify-between">
           <button type="button" className="btn-ghost" onClick={onClose}>
             Cancel
@@ -737,8 +726,8 @@ function Editor({ row, onClose }: { row: Row | null; onClose: () => void }) {
               type="button"
               className="btn bg-red-600 hover:bg-red-700"
               onClick={async () => {
-                if (!confirm(`Delete this entry: “${r.identity?.title}”?`)) return;
-                await db.library.delete(r.id);
+                if (!confirm(`Delete this entry: "${current.identity?.title}"`)) return;
+                await db.library.delete(current.id);
                 onClose();
                 location.reload();
               }}
@@ -753,4 +742,14 @@ function Editor({ row, onClose }: { row: Row | null; onClose: () => void }) {
       </form>
     </Modal>
   );
+}
+
+function pickBestEntry(entries: Row[]): Row {
+  const order: Status[] = ["Playing", "Backlog", "Owned", "Wishlist", "Beaten", "Abandoned"];
+  const byStatus = new Map(order.map((s, i) => [s, i] as const));
+  return ([...entries].sort((a, b) => {
+    const sa = byStatus.get(a.status) ?? 999;
+    const sb = byStatus.get(b.status) ?? 999;
+    return sa - sb;
+  })[0] || entries[0]);
 }
