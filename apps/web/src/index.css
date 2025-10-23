@@ -139,3 +139,159 @@
 .drawer-title {
   font-weight: 600;
 }
+
+.gt-hud-root {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 60;
+  pointer-events: none;
+}
+
+.gt-hud {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  z-index: 60;
+  pointer-events: none;
+  overflow: hidden;
+}
+
+.gt-hud__init {
+  height: 100%;
+  background: linear-gradient(
+    90deg,
+    hsl(210 90% 55%),
+    hsl(150 80% 50%),
+    hsl(280 85% 60%)
+  );
+  background-size: 200% 100%;
+  animation: gt-hud-shimmer 2.8s linear infinite;
+  filter: saturate(1.1);
+}
+
+.gt-hud__prog {
+  height: 100%;
+  background: currentColor;
+  opacity: 0.9;
+}
+
+.gt-hud-card {
+  pointer-events: auto;
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  min-width: 220px;
+  max-width: 320px;
+  padding: 0.75rem 0.85rem;
+  border-radius: 0.75rem;
+  background: rgba(15, 15, 18, 0.9);
+  color: white;
+  box-shadow: 0 12px 32px rgba(15, 15, 18, 0.28);
+  backdrop-filter: blur(8px);
+  font-size: 0.85rem;
+}
+
+.gt-hud-card__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.gt-hud-card__title {
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.gt-hud-card__actions {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.gt-hud-card__btn {
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.72rem;
+  padding: 0.25rem 0.7rem;
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+}
+
+.gt-hud-card__btn:hover {
+  background: rgba(255, 255, 255, 0.16);
+  border-color: rgba(255, 255, 255, 0.45);
+}
+
+.gt-hud-card__subtitle {
+  margin-top: 0.35rem;
+  opacity: 0.75;
+}
+
+.gt-hud-card__latest {
+  margin-top: 0.35rem;
+  line-height: 1.35;
+}
+
+.enrich-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  padding: 0.15rem 0.55rem;
+  font-size: 0.7rem;
+  font-weight: 500;
+  background: #e4e4e7;
+  color: #27272a;
+}
+
+.enrich-chip--pending {
+  background: #e0f2fe;
+  color: #0c4a6e;
+}
+
+.enrich-chip--fetching {
+  background: #c7d2fe;
+  color: #1d4ed8;
+}
+
+.enrich-chip--paused {
+  background: #fde68a;
+  color: #92400e;
+}
+
+.enrich-chip--done {
+  background: #bbf7d0;
+  color: #166534;
+}
+
+.enrich-chip--skipped {
+  background: #f1f5f9;
+  color: #475569;
+}
+
+.enrich-chip--error {
+  background: #fecaca;
+  color: #b91c1c;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .gt-hud__init {
+    animation: none;
+  }
+}
+
+@keyframes gt-hud-shimmer {
+  0% {
+    background-position: 0% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}

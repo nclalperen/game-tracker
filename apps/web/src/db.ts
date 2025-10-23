@@ -16,6 +16,7 @@ class GTDb extends Dexie {
   accounts!: Table<Account, string>;
   members!: Table<Member, string>;
   library!: Table<LibraryItem, string>;
+  settings!: Table<{ key: string; value: unknown }, string>;
 
   constructor() {
     super("game-tracker");
@@ -31,7 +32,7 @@ class GTDb extends Dexie {
     // ---------- v2: add appid & igdbCoverId to identities ----------
     this.version(2)
       .stores({
-        identities: "id, title, platform, appid, igdbCoverId",
+        identities: "id, title, platform, appid, igdbCoverId, ttbMedianMainH",
         accounts: "id, label, platform",
         members: "id, name",
         library: "id, identityId, accountId, memberId, status, acquiredAt",
@@ -41,13 +42,14 @@ class GTDb extends Dexie {
         await table.toCollection().modify((row: any) => {
           if (typeof row.appid === "undefined") row.appid = undefined;
           if (typeof row.igdbCoverId === "undefined") row.igdbCoverId = undefined;
+          if (typeof row.ttbMedianMainH === "undefined") row.ttbMedianMainH = undefined;
         });
       });
 
     // ---------- v3: introduce ttbSource on library ----------
     this.version(3)
       .stores({
-        identities: "id, title, platform, appid, igdbCoverId",
+        identities: "id, title, platform, appid, igdbCoverId, ttbMedianMainH",
         accounts: "id, label, platform",
         members: "id, name",
         library: "id, identityId, accountId, memberId, status, acquiredAt, ttbSource",
@@ -62,7 +64,7 @@ class GTDb extends Dexie {
     // ---------- v4: move ttbSource to identities ----------
     this.version(4)
       .stores({
-        identities: "id, title, platform, appid, igdbCoverId, ttbSource",
+        identities: "id, title, platform, appid, igdbCoverId, ttbSource, ttbMedianMainH",
         accounts: "id, label, platform",
         members: "id, name",
         library: "id, identityId, accountId, memberId, status, acquiredAt",
@@ -86,16 +88,17 @@ class GTDb extends Dexie {
         });
       });
 
-    // ---------- v5: add currencyCode to library ----------
+    // ---------- v5: add currencyCode and ttbMedianMainH ----------
     this.version(5)
       .stores({
-        identities: "id, title, platform, appid, igdbCoverId, ttbSource",
+        identities: "id, title, platform, appid, igdbCoverId, ttbSource, ttbMedianMainH",
         accounts: "id, label, platform",
         members: "id, name",
         library: "id, identityId, accountId, memberId, status, acquiredAt, currencyCode",
       })
       .upgrade(async (tx) => {
         const libTable = tx.table("library");
+        const identTable = tx.table("identities");
         await libTable.toCollection().modify((row: any) => {
           if (typeof row.currencyCode === "undefined") {
             if (typeof row.priceCurrency === "string") {
@@ -108,16 +111,80 @@ class GTDb extends Dexie {
             delete (row as any).priceCurrency;
           }
         });
+
+        await libTable.toCollection().each(async (row: any) => {
+          if (row.ttbMedianMainH != null) {
+            await identTable.update(row.identityId, {
+              ttbMedianMainH: row.ttbMedianMainH,
+            });
+          }
+        });
       });
+
+    // ---------- v6: introduce settings key/value store ----------
+    this.version(6).stores({
+      identities: "id, title, platform, appid, igdbCoverId, ttbSource, ttbMedianMainH",
+      accounts: "id, label, platform",
+      members: "id, name",
+      library: "id, identityId, accountId, memberId, status, acquiredAt, currencyCode",
+      settings: "key",
+    });
 
     this.identities = this.table("identities");
     this.accounts = this.table("accounts");
     this.members = this.table("members");
     this.library = this.table("library");
+    this.settings = this.table("settings");
   }
 }
 
 export const db = new GTDb();
+
+export type EnrichStatus =
+  | "pending"
+  | "fetching"
+  | "paused"
+  | "done"
+  | "skipped"
+  | "error";
+
+export type EnrichRowSnapshot = {
+  id: string;
+  identityId: string;
+  title: string;
+  appid?: number | null;
+  status: EnrichStatus;
+  updatedAt: number;
+  price?: number | null;
+  currencyCode?: string | null;
+  ttb?: number | null;
+  ttbSource?: Identity["ttbSource"];
+  ocScore?: number | null;
+  message?: string | null;
+};
+
+export type EnrichRowSummary = {
+  id: string;
+  title: string;
+  finishedAt: number;
+  price?: number | null;
+  currencyCode?: string | null;
+  ttb?: number | null;
+  ocScore?: number | null;
+};
+
+export type EnrichSession = {
+  sessionId: string;
+  startedAt: number;
+  lastUpdated: number;
+  paused: boolean;
+  totalRows: number;
+  completedCount: number;
+  region?: string;
+  queue: EnrichRowSnapshot[];
+  recent: EnrichRowSummary[];
+  phase?: "idle" | "init" | "active" | "paused" | "done";
+};
 
 /** Clear all app data (used by the "Clear Profile" button). */
 export async function clearAllData() {
@@ -147,3 +214,20 @@ export async function withRW<T>(fn: () => Promise<T>) {
     fn,
   );
 }
+
+const ENRICH_SESSION_KEY = "import_enrich_session";
+
+export async function getEnrichSession(): Promise<EnrichSession | null> {
+  const row = await db.settings.get(ENRICH_SESSION_KEY);
+  if (!row) return null;
+  return row.value as EnrichSession;
+}
+
+export async function setEnrichSession(session: EnrichSession) {
+  await db.settings.put({ key: ENRICH_SESSION_KEY, value: session });
+}
+
+export async function clearEnrichSession() {
+  await db.settings.delete(ENRICH_SESSION_KEY);
+}
+

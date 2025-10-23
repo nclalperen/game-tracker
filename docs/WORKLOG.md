@@ -39,3 +39,6 @@ Local-first desktop and web app to ingest personal game libraries, enrich metada
 - 2025-02-14: Restored Tailwind styling/cards, added debounced title search, and surfaced store badges in library view.
 - 2025-02-14: Removed legacy `old*` web pages and re-enabled full TypeScript coverage.
 - 2025-02-14: Added Dexie v5 migration (`currencyCode`), moved TTB source tracking onto identities, and refreshed editor/bulk fetch flows.
+- 2025-02-23: Added Dexie v6 `settings` key/value store for enrichment state and introduced background enrichment with pause/resume and a floating status bar.
+- 2025-02-24: Implemented a singleton enrichment runner with persisted sessions, minimal HUD overlay, and a hideable Import Wizard. Updated `ImportWizard.tsx`, `state/enrichmentRunner.ts`, `overlays/EnrichmentHUD.tsx`, and styling/Library hooks; verified via `pnpm build` (web) — noted existing Vite dynamic import warning. Known limitation: Tauri bridge calls still lack abort support, so pause waits for the current request to settle.
+- 2025-02-24: Added runner `phase` lifecycle (`idle/init/active/paused/done`) with a 600ms minimum init window, shader-style init line (`gt-hud__init`) that swaps to progress fill (`gt-hud__prog`), and reduced-motion guard. `EnrichmentHUD` now reads `snapshot.phase` to switch lines while keeping popover controls unchanged.
