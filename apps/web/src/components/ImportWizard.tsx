@@ -1,515 +1,694 @@
-import { useMemo, useState } from "react";
-import Modal from "@/components/Modal";
-import { db } from "@/db";
-
-// local importers (CSV + mapping)
+import { useCallback, useEffect, useMemo, useState } from "react";
+import Modal from "./Modal";
+import { db, type EnrichStatus } from "@/db";
+import {
+  useEnrichmentRunner,
+  type EnrichRow,
+  type RunnerSnapshot,
+} from "@/state/enrichmentRunner";
+import { isTauri } from "@/desktop/bridge";
 import {
   readCSV,
   rowsToEntities,
   type FieldMap,
   type IncomingRow,
+  type Identity,
+  type LibraryItem,
 } from "@tracker/core";
 
-// Guess field mapping based on common header names
-function guessFieldMap(headers: string[]): FieldMap {
-  const find = (names: string[]) =>
-    headers.find((h) =>
-      names.map((n) => n.toLowerCase()).includes(h.trim().toLowerCase())
-    );
-  return {
-    title: find(["title", "game", "name"]),
-    platform: find(["platform", "system"]),
-    status: find(["status", "state"]),
-    memberId: find(["member", "owner", "who"]),
-    accountId: find(["account", "store", "launcher"]),
-    priceTRY: find(["price", "price_try", "price (try)"]),
-    acquiredAt: find(["date", "acquired", "purchased"]),
-    ocScore: find(["oc", "openscore", "opencritic"]),
-    ttbMedianMainH: find(["ttb", "howlong", "hours", "main"]),
-    services: find(["services", "availability", "game pass", "ea play"]),
-  };
-}
+type Step = "source" | "map" | "review" | "enrich";
 
-// Android CSV looks like regular CSV to our parser
-const readAndroidTakeoutCSV = readCSV;
+const STEPS: Step[] = ["source", "map", "review", "enrich"];
+const STEP_LABELS: Record<Step, string> = {
+  source: "Select source",
+  map: "Map columns",
+  review: "Review & import",
+  enrich: "Enrich metadata",
+};
 
-// Installed scan is a stub in the browser
-function installedScanStub() {
-  return {
-    ok: false,
-    message:
-      "Installed Scan is limited in the browser for privacy/sandbox reasons. Use Steam HTML import or CSV.",
-  };
-}
-
-
-// shared core (html parser + types/flags)
-import { parseSteamAllGamesHTML, type Platform, flags } from "@tracker/core";
-
-// optional Steam Web API connector (can leave as-is or stub)
-import { fetchSteamOwnedGames } from "@/connectors/steam";
-
-type Source = "installed" | "manualCsv" | "androidCsv" | "steam" | "steamHtml";
-type Step = 1 | 2 | 3 | 4;
-
-function prevStep(s: Step): Step {
-  return s === 1 ? 1 : ((s - 1) as Step);
-}
-function nextStep(s: Step): Step {
-  return s === 4 ? 4 : ((s + 1) as Step);
-}
-
-export default function ImportWizard({
-  open,
-  onClose,
-}: {
+type ImportWizardProps = {
   open: boolean;
   onClose: () => void;
-}) {
-  if (!open) return null;
+  onImported?: () => Promise<void> | void;
+};
 
-  const [step, setStep] = useState<Step>(1);
-  const [source, setSource] = useState<Source | null>(null);
-  const [rows, setRows] = useState<IncomingRow[]>([]);
-  const [headers, setHeaders] = useState<string[]>([]);
-  const [map, setMap] = useState<FieldMap>({});
-  const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
+type PreviewBundle = {
+  identities: Identity[];
+  library: LibraryItem[];
+};
 
-  function resetAll() {
-    setStep(1);
-    setSource(null);
-    setRows([]);
-    setHeaders([]);
-    setMap({});
-    setBusy(false);
-    setMessage(null);
-  }
+export default function ImportWizard({ open, onClose, onImported }: ImportWizardProps) {
+  const [step, setStep] = useState<Step>("source");
+  const [fileName, setFileName] = useState<string>("");
+  const [rawRows, setRawRows] = useState<IncomingRow[]>([]);
+  const [fieldMap, setFieldMap] = useState<FieldMap>({});
+  const [preview, setPreview] = useState<PreviewBundle | null>(null);
+  const [importing, setImporting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [pendingEnrichRows, setPendingEnrichRows] = useState<EnrichRow[]>([]);
+  const [autoStartEnrich, setAutoStartEnrich] = useState(true);
 
-  function close() {
-    resetAll();
+  const { snapshot, start, pause, resume, cancel } = useEnrichmentRunner();
+
+  const columns = useMemo(() => {
+    const keys = new Set<string>();
+    for (const row of rawRows) {
+      Object.keys(row).forEach((key) => keys.add(key));
+    }
+    return Array.from(keys);
+  }, [rawRows]);
+
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    setError(null);
+    if (snapshot.sessionId) {
+      setStep("enrich");
+    } else if (!rawRows.length) {
+      setStep("source");
+    }
+  }, [open, snapshot.sessionId, rawRows.length]);
+
+  const resetWizard = () => {
+    setFileName("");
+    setRawRows([]);
+    setFieldMap({});
+    setPreview(null);
+    setPendingEnrichRows([]);
+    setAutoStartEnrich(true);
+    setError(null);
+    setStep("source");
+  };
+
+  const handleClose = () => {
     onClose();
-  }
+  };
 
-  const canNextFrom1 = !!source;
-  const canNextFrom2 = rows.length > 0;
-
-  const body = useMemo(() => {
-    // STEP 1 — source
-    if (step === 1) {
-      return (
-        <div className="space-y-3">
-          <p className="text-sm text-zinc-600">
-            Choose what you want to import. Everything stays local (IndexedDB). You can also use regular JSON/CSV import from the Library page.
-          </p>
-          <div className="grid sm:grid-cols-3 gap-3">
-            <Card
-              title="Installed Scan (Windows)"
-              desc="Browser-limited; shows a friendly explanation and alternatives."
-              selected={source === "installed"}
-              onClick={() => setSource("installed")}
-            />
-            <Card
-              title="Manual CSV"
-              desc="Import a custom CSV (Steam/Epic/PSN/Xbox/Switch exports)."
-              selected={source === "manualCsv"}
-              onClick={() => setSource("manualCsv")}
-            />
-            <Card
-              title="Android Takeout CSV"
-              desc="Google Takeout for Play Games library; CSV parsing supported."
-              selected={source === "androidCsv"}
-              onClick={() => setSource("androidCsv")}
-            />
-            <Card
-              title="Steam HTML (no key)"
-              desc="Upload saved All Games page."
-              selected={source === "steamHtml"}
-              onClick={() => setSource("steamHtml")}
-            />
-            <Card
-              title="Steam (public profile)"
-              desc="Import via Steam Web API (requires API key; may be blocked by CORS on web)."
-              selected={source === "steam"}
-              onClick={() => setSource("steam")}
-            />
-          </div>
-        </div>
-      );
-    }
-
-    // STEP 2 — mapping / fetch inputs per source
-    if (step === 2) {
-      // Steam (Web API)
-      if (source === "steam") {
-        return (
-          <div className="space-y-3">
-            <p className="text-sm text-zinc-600">
-              Requires your SteamID64 (not your custom URL).{" "}
-              <a
-                href="https://steamid.io/"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-emerald-500 underline"
-              >
-                Find your SteamID64
-              </a>
-              . Your profile must be public.
-            </p>
-            <SteamForm
-              onFetched={(gs) => {
-                const rs = gs.map((g: any) => ({
-                  Title: `${g.name} https://store.steampowered.com/app/${g.appid}`,
-                }));
-                setRows(rs);
-                const hs = Object.keys(rs[0] || {});
-                setHeaders(hs);
-                setMap({ title: "Title" });
-                setMessage(`${rs.length} game(s) fetched from Steam.`);
-              }}
-            />
-          </div>
-        );
+  const handleFile = async (file: File) => {
+    try {
+      const text = await file.text();
+      let rows: IncomingRow[];
+      if (file.name.endsWith(".json")) {
+        const parsed = JSON.parse(text);
+        if (!Array.isArray(parsed)) {
+          throw new Error("JSON import expects an array of rows.");
+        }
+        rows = parsed as IncomingRow[];
+      } else {
+        rows = readCSV(text) as IncomingRow[];
       }
-
-      // Steam HTML (no key)
-      if (source === "steamHtml") {
-        return (
-          <div className="space-y-3">
-            <p className="text-sm text-zinc-600">
-              Open your Steam All Games page (public), save it as HTML, then upload the file here.
-            </p>
-            <input
-              type="file"
-              accept=".html,.htm,text/html"
-              onChange={async (e) => {
-                const f = e.target.files?.[0];
-                if (!f) return;
-                const text = await f.text();
-                const games = parseSteamAllGamesHTML(text);
-                const rs = games.map((g) => ({
-                  Title: `${g.name} https://store.steampowered.com/app/${g.appid}`,
-                }));
-                setRows(rs);
-                setHeaders(Object.keys(rs[0] || {}));
-                setMap({ title: "Title" });
-                setMessage(`${rs.length} game(s) parsed.`);
-              }}
-            />
-            {message && <div className="text-xs text-emerald-700">{message}</div>}
-          </div>
-        );
+      if (!rows.length) {
+        throw new Error("No rows detected in file.");
       }
+      setFileName(file.name);
+      setRawRows(rows);
+      const guessed = guessFieldMap(rows);
+      setFieldMap(guessed);
+      setStep("map");
+      setError(null);
+    } catch (err: any) {
+      setError(err?.message || "Failed to read file.");
+    }
+  };
 
-      // Installed (stub)
-      if (source === "installed") {
-        const stub = installedScanStub();
-        return (
-          <div className="space-y-3">
-            <p className="text-sm">{stub.message}</p>
-            <ul className="list-disc pl-5 text-sm text-zinc-600">
-              <li>Use Export CSV from your store/launcher (Steam, Epic, PSN, Xbox, Switch).</li>
-              <li>Or use Export JSON/CSV from the Library page to see the expected format.</li>
-              <li>Android users: Google Takeout → Play Games → CSV → choose “Android Takeout CSV”.</li>
-            </ul>
-          </div>
-        );
+  const buildPreview = () => {
+    if (!rawRows.length) {
+      setError("No rows loaded.");
+      return;
+    }
+    if (!fieldMap.title) {
+      setError("Map at least the Title column.");
+      return;
+    }
+    try {
+      const bundle = rowsToEntities(rawRows, fieldMap);
+      if (!bundle.library.length) {
+        setError("Import produced no library rows.");
+        return;
       }
-
-      // manualCsv / androidCsv
-      return (
-        <div className="space-y-3">
-          <p className="text-sm text-zinc-600">Upload your CSV. We’ll try to guess columns and let you adjust mappings.</p>
-          <input
-            type="file"
-            accept=".csv,text/csv"
-            onChange={async (e) => {
-              const f = e.target.files?.[0];
-              if (!f) return;
-              const text = await f.text();
-              const rs = source === "androidCsv" ? readAndroidTakeoutCSV(text) : readCSV(text);
-              setRows(rs);
-              const hs = Object.keys(rs[0] || {});
-              setHeaders(hs);
-              setMap(guessFieldMap(hs));
-              setMessage(`${rs.length} row(s) parsed.`);
-            }}
-          />
-          {message && <div className="text-xs text-emerald-700">{message}</div>}
-          {headers.length > 0 && (
-            <div className="mt-3 space-y-2">
-              <MappingRow label="Title" value={map.title} onChange={(v) => setMap({ ...map, title: v })} headers={headers} />
-              <MappingRow label="Platform" value={map.platform} onChange={(v) => setMap({ ...map, platform: v })} headers={headers} />
-              <MappingRow label="Status" value={map.status} onChange={(v) => setMap({ ...map, status: v })} headers={headers} />
-              <MappingRow label="Member" value={map.memberId} onChange={(v) => setMap({ ...map, memberId: v })} headers={headers} />
-              <MappingRow label="Account" value={map.accountId} onChange={(v) => setMap({ ...map, accountId: v })} headers={headers} />
-              <MappingRow label="Price (₺)" value={map.priceTRY} onChange={(v) => setMap({ ...map, priceTRY: v })} headers={headers} />
-              <MappingRow label="Date" value={map.acquiredAt} onChange={(v) => setMap({ ...map, acquiredAt: v })} headers={headers} />
-              <MappingRow label="OpenCritic" value={map.ocScore} onChange={(v) => setMap({ ...map, ocScore: v })} headers={headers} />
-              <MappingRow label="TTB (h)" value={map.ttbMedianMainH} onChange={(v) => setMap({ ...map, ttbMedianMainH: v })} headers={headers} />
-              <MappingRow label="Services" value={map.services} onChange={(v) => setMap({ ...map, services: v })} headers={headers} />
-            </div>
-          )}
-        </div>
-      );
+      setPreview(bundle);
+      const identityById = new Map(bundle.identities.map((i) => [i.id, i] as const));
+      const tasks: EnrichRow[] = bundle.library.map((item) => ({
+        id: item.id,
+        identityId: item.identityId,
+        title: identityById.get(item.identityId)?.title ?? "Untitled",
+        appid: identityById.get(item.identityId)?.appid,
+      }));
+      setPendingEnrichRows(tasks);
+      setStep("review");
+      setError(null);
+    } catch (err: any) {
+      setError(err?.message || "Failed to build preview.");
     }
+  };
 
-    // STEP 3 — preview
-    if (step === 3) {
-      const preview = rows.slice(0, 5);
-      return (
-        <div className="space-y-3">
-          <p className="text-sm text-zinc-600">Review a small preview. If it looks right, continue to import.</p>
-          <div className="overflow-auto border border-zinc-200 rounded-lg">
-            <table className="table">
-              <thead>
-                <tr>{headers.map((h) => <th key={h}>{h}</th>)}</tr>
-              </thead>
-              <tbody>
-                {preview.map((r, i) => (
-                  <tr key={i}>{headers.map((h) => <td key={h}>{r[h]}</td>)}</tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          <p className="text-xs text-zinc-500">Showing {preview.length} of {rows.length} row(s).</p>
-        </div>
-      );
+  const handleImport = async () => {
+    if (!preview) return;
+    setImporting(true);
+    setError(null);
+    try {
+      await db.transaction("rw", db.identities, db.library, async () => {
+        if (preview.identities.length) {
+          await db.identities.bulkPut(preview.identities);
+        }
+        if (preview.library.length) {
+          await db.library.bulkPut(preview.library);
+        }
+      });
+      if (onImported) {
+        await onImported();
+      }
+      setImporting(false);
+      setStep("enrich");
+    } catch (err: any) {
+      setImporting(false);
+      setError(err?.message || "Failed to persist imported data.");
     }
+  };
 
-    // STEP 4 — import
-    return (
-      <div className="space-y-3">
-        <p className="text-sm text-zinc-600">Importing will merge into your local database. Nothing is sent anywhere.</p>
-        <button
-          className="btn"
-          disabled={busy || rows.length === 0}
-          onClick={async () => {
-            if (!map.title) {
-              alert("Please map the Title column before importing.");
-              return;
-            }
+  const handleStartEnrichment = useCallback(() => {
+    if (!pendingEnrichRows.length) {
+      setError("Nothing to enrich.");
+      return;
+    }
+    if (snapshot.sessionId) {
+      setError("Enrichment already running. Pause or cancel it first.");
+      return;
+    }
+    const region = (localStorage.getItem("steam_cc") || "us").toLowerCase();
+    start(pendingEnrichRows, { region });
+    setPendingEnrichRows([]);
+    setAutoStartEnrich(true);
+  }, [pendingEnrichRows, snapshot.sessionId, start]);
 
-            try {
-              setBusy(true);
-
-              const { identities, library } = rowsToEntities(rows, map);
-              if (identities.length === 0 && library.length === 0) {
-                console.warn("[Import] No valid rows. Check Title mapping.", { map, sample: rows.slice(0, 3) });
-                alert("Nothing to import. Check your Title mapping.");
-                return;
-              }
-
-              const [existingMembers, existingAccounts, existingIdentities] = await Promise.all([
-                db.members.toArray(),
-                db.accounts.toArray(),
-                db.identities.toArray(),
-              ]);
-
-              const memberByName = new Map(existingMembers.map((m) => [m.name.trim().toLowerCase(), m]));
-              const accountByLabel = new Map(existingAccounts.map((a) => [a.label.trim().toLowerCase(), a]));
-
-              if (!memberByName.has("everyone")) {
-                const everyone = { id: "everyone", name: "Everyone" };
-                await db.members.put(everyone);
-                memberByName.set("everyone", everyone);
-              }
-
-              const toPutMembers: any[] = [];
-              const toPutAccounts: any[] = [];
-
-              const resolvedLibrary = library.map((li) => {
-                // resolve/create member
-                let memberId = li.memberId;
-                if (memberId && !existingMembers.find((m) => m.id === memberId)) {
-                  const byName = memberByName.get(memberId.trim().toLowerCase());
-                  if (byName) memberId = byName.id;
-                  else if (memberId.toLowerCase() !== "everyone") {
-                    const newMember = { id: `m-${crypto.randomUUID()}`, name: memberId };
-                    toPutMembers.push(newMember);
-                    memberByName.set(memberId.trim().toLowerCase(), newMember);
-                    memberId = newMember.id;
-                  } else memberId = "everyone";
-                } else if (!memberId) {
-                  memberId = "everyone";
-                }
-
-                // resolve/create account by label
-                let accountId = li.accountId;
-                const accountLabel = li.accountId ?? "";
-                const foundByLabel = accountByLabel.get(accountLabel.trim().toLowerCase());
-
-                if (accountLabel && !foundByLabel) {
-                  const ident = existingIdentities.find((i) => i.id === li.identityId);
-                  const platform: Platform = (ident?.platform as Platform | undefined) ?? "PC";
-                  const newAcc = { id: `a-${crypto.randomUUID()}`, platform, label: accountLabel };
-                  toPutAccounts.push(newAcc);
-                  accountByLabel.set(accountLabel.trim().toLowerCase(), newAcc);
-                  accountId = newAcc.id;
-                } else if (foundByLabel) {
-                  accountId = foundByLabel.id;
-                } else if (!accountLabel) {
-                  accountId = undefined;
-                }
-
-                return { ...li, memberId, accountId };
-              });
-
-              await db.transaction("rw", db.members, db.accounts, db.identities, db.library, async () => {
-                if (toPutMembers.length) await db.members.bulkPut(toPutMembers);
-                if (toPutAccounts.length) await db.accounts.bulkPut(toPutAccounts);
-                if (identities.length) await db.identities.bulkPut(identities);
-                if (resolvedLibrary.length) await db.library.bulkPut(resolvedLibrary);
-              });
-
-              alert(
-                `Imported:\n` +
-                  `• ${identities.length} identities\n` +
-                  `• ${resolvedLibrary.length} library entries\n` +
-                  (toPutMembers.length ? `• ${toPutMembers.length} member(s) created\n` : "") +
-                  (toPutAccounts.length ? `• ${toPutAccounts.length} account(s) created\n` : "")
-              );
-
-              close();
-              location.reload();
-            } catch (err: any) {
-              console.error("[Import] failed", err);
-              alert(`Import failed: ${err?.message || err}`);
-            } finally {
-              setBusy(false);
-            }
-          }}
-        >
-          {busy ? "Importing…" : "Import now"}
-        </button>
-      </div>
-    );
-  }, [step, source, rows, headers, map, busy]);
+  const stepIndex = STEPS.indexOf(step);
 
   return (
-    <Modal open={open} title="Import Wizard" onClose={close}>
-      {/* Stepper header */}
-      <div className="mb-3 flex items-center gap-2 text-sm">
-        {["1. Source", "2. Map", "3. Review", "4. Import"].map((t, i) => {
-          const n = (i + 1) as Step;
-          return (
-            <span
-              key={t}
-              className={`px-2 py-1 rounded ${
-                step === n ? "bg-emerald-100 text-emerald-800" : "bg-zinc-100 text-zinc-700"
-              }`}
-            >
-              {t}
-            </span>
-          );
-        })}
+    <Modal open={open} onClose={handleClose} title="Import Library">
+      <div className="flex items-center gap-2 text-xs uppercase tracking-wide text-zinc-500">
+        {STEPS.map((s, idx) => (
+          <span
+            key={s}
+            className={idx === stepIndex ? "font-semibold text-zinc-900" : "opacity-70"}
+          >
+            {STEP_LABELS[s]}
+            {idx < STEPS.length - 1 ? " ·" : ""}
+          </span>
+        ))}
       </div>
 
-      {body}
-
-      {/* Footer nav */}
-      <div className="mt-4 flex items-center justify-between">
-        <button className="btn-ghost" onClick={close}>
-          Cancel
-        </button>
-        <div className="flex gap-2">
-          <button className="btn-ghost" disabled={step === 1} onClick={() => setStep((s) => prevStep(s))}>
-            Back
-          </button>
-          <button
-            className="btn"
-            disabled={(step === 1 && !canNextFrom1) || (step === 2 && !canNextFrom2)}
-            onClick={() => setStep((s) => nextStep(s))}
-          >
-            Next
-          </button>
+      {error && (
+        <div className="mt-3 rounded-md border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-700">
+          {error}
         </div>
+      )}
+
+      <div className="mt-4">
+        {step === "source" && (
+          <SourceStep
+            fileName={fileName}
+            onReset={resetWizard}
+            onFile={handleFile}
+          />
+        )}
+
+        {step === "map" && (
+          <MapStep
+            columns={columns}
+            fieldMap={fieldMap}
+            onChange={setFieldMap}
+            onBack={() => setStep("source")}
+            onNext={buildPreview}
+          />
+        )}
+
+        {step === "review" && preview && (
+          <ReviewStep
+            preview={preview}
+            onBack={() => setStep("map")}
+            onImport={handleImport}
+            importing={importing}
+            autoStart={autoStartEnrich}
+            onAutoStartChange={setAutoStartEnrich}
+          />
+        )}
+
+        {step === "enrich" && (
+          <EnrichStep
+            pendingRows={pendingEnrichRows}
+            autoStart={autoStartEnrich}
+            onStart={handleStartEnrichment}
+            onClose={handleClose}
+            onReset={resetWizard}
+            snapshot={snapshot}
+            pause={pause}
+            resume={resume}
+            cancel={cancel}
+          />
+        )}
       </div>
     </Modal>
   );
 }
 
-function Card({
-  title,
-  desc,
-  selected,
-  onClick,
+function SourceStep({
+  fileName,
+  onFile,
+  onReset,
 }: {
-  title: string;
-  desc: string;
-  selected: boolean;
-  onClick: () => void;
+  fileName: string;
+  onFile: (file: File) => void;
+  onReset: () => void;
 }) {
   return (
-    <button type="button" onClick={onClick} className={`text-left card ${selected ? "ring-2 ring-emerald-500" : ""}`}>
-      <div className="font-medium">{title}</div>
-      <div className="text-sm text-zinc-600 mt-1">{desc}</div>
-    </button>
+    <div className="space-y-4">
+      <p className="text-sm text-zinc-600">
+        Import a CSV or JSON export of your library. The wizard will help map fields,
+        review rows, and optionally enrich metadata in the background.
+      </p>
+
+      <label className="flex flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-zinc-300 bg-zinc-50 px-6 py-8 text-center hover:border-zinc-400">
+        <span className="text-sm font-medium text-zinc-700">
+          {fileName ? "Replace file" : "Select a file"}
+        </span>
+        <span className="text-xs text-zinc-500">CSV (.csv) or JSON (.json)</span>
+        <input
+          type="file"
+          accept=".csv,.json"
+          className="hidden"
+          onChange={(event) => {
+            const file = event.target.files?.[0];
+            if (file) onFile(file);
+            event.target.value = "";
+          }}
+        />
+      </label>
+
+      {fileName && (
+        <div className="flex items-center justify-between rounded-md border border-zinc-200 bg-white px-3 py-2 text-sm">
+          <span className="truncate">{fileName}</span>
+          <button type="button" className="btn-ghost" onClick={onReset}>
+            Reset
+          </button>
+        </div>
+      )}
+    </div>
   );
 }
 
-function MappingRow({
-  label,
-  value,
+function MapStep({
+  columns,
+  fieldMap,
   onChange,
-  headers,
+  onBack,
+  onNext,
 }: {
-  label: string;
-  value?: string;
-  onChange: (v: string | undefined) => void;
-  headers: string[];
+  columns: string[];
+  fieldMap: FieldMap;
+  onChange: (map: FieldMap) => void;
+  onBack: () => void;
+  onNext: () => void;
 }) {
+  const fields: Array<{ key: keyof FieldMap; label: string; required?: boolean }> = [
+    { key: "title", label: "Title", required: true },
+    { key: "platform", label: "Platform" },
+    { key: "status", label: "Status" },
+    { key: "memberId", label: "Member" },
+    { key: "accountId", label: "Account / Store" },
+    { key: "priceTRY", label: "Price" },
+    { key: "acquiredAt", label: "Acquired at" },
+    { key: "ocScore", label: "OpenCritic score" },
+    { key: "ttbMedianMainH", label: "HowLongToBeat main (hrs)" },
+    { key: "services", label: "Tags / Services" },
+  ];
+
+  const handleSelect = (key: keyof FieldMap, value: string) => {
+    onChange({
+      ...fieldMap,
+      [key]: value || undefined,
+    });
+  };
+
   return (
-    <label className="flex items-center gap-2 text-sm">
-      <span className="w-28 text-zinc-500">{label}</span>
-      <select className="select" value={value ?? ""} onChange={(e) => onChange(e.target.value || undefined)}>
-        <option value="">—</option>
-        {headers.map((h) => (
-          <option key={h} value={h}>
-            {h}
-          </option>
+    <div className="space-y-4">
+      <p className="text-sm text-zinc-600">
+        Match the columns from your file to Game Tracker fields. Required fields are marked.
+      </p>
+      <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+        {fields.map((field) => (
+          <label key={field.key} className="flex flex-col gap-1 text-sm">
+            <span className="font-medium text-zinc-700">
+              {field.label}
+              {field.required ? " *" : ""}
+            </span>
+            <select
+              className="select"
+              value={fieldMap[field.key] ?? ""}
+              onChange={(event) => handleSelect(field.key, event.target.value)}
+            >
+              <option value="">-- Ignore --</option>
+              {columns.map((col) => (
+                <option key={col} value={col}>
+                  {col}
+                </option>
+              ))}
+            </select>
+          </label>
         ))}
-      </select>
-    </label>
+      </div>
+
+      <div className="flex justify-between pt-2">
+        <button type="button" className="btn-ghost" onClick={onBack}>
+          Back
+        </button>
+        <button type="button" className="btn" onClick={onNext}>
+          Continue
+        </button>
+      </div>
+    </div>
   );
 }
 
-function SteamForm({ onFetched }: { onFetched: (games: any[]) => void }) {
-  const [steamId, setSteamId] = useState("");
-  const [apiKey, setApiKey] = useState("");
-  const [busy, setBusy] = useState(false);
-
-  if (!flags.steamImportEnabled) {
-    return <div className="text-sm text-zinc-500">Steam import is not enabled. Toggle it in Settings.</div>;
-  }
+function ReviewStep({
+  preview,
+  onBack,
+  onImport,
+  importing,
+  autoStart,
+  onAutoStartChange,
+}: {
+  preview: PreviewBundle;
+  onBack: () => void;
+  onImport: () => void;
+  importing: boolean;
+  autoStart: boolean;
+  onAutoStartChange: (value: boolean) => void;
+}) {
+  const topRows = preview.library.slice(0, 6);
+  const identityById = new Map(preview.identities.map((i) => [i.id, i] as const));
 
   return (
-    <form
-      className="space-y-2"
-      onSubmit={async (e) => {
-        e.preventDefault();
-        try {
-          setBusy(true);
-          const games = await fetchSteamOwnedGames(steamId.trim(), apiKey.trim());
-          onFetched(games);
-        } catch (err: any) {
-          alert(err?.message || String(err));
-        } finally {
-          setBusy(false);
-        }
-      }}
-    >
-      <div>
-        <label className="text-xs text-zinc-500">SteamID64</label>
-        <input className="input" placeholder="7656119xxxxxxxxxx" value={steamId} onChange={(e) => setSteamId(e.target.value)} />
+    <div className="space-y-4">
+      <p className="text-sm text-zinc-600">
+        {preview.identities.length} identities and {preview.library.length} library rows detected.
+      </p>
+
+      <div className="max-h-64 overflow-auto rounded-md border border-zinc-200">
+        <table className="table">
+          <thead>
+            <tr>
+              <th>Title</th>
+              <th>Platform</th>
+              <th>Status</th>
+              <th>Member</th>
+            </tr>
+          </thead>
+          <tbody>
+            {topRows.map((row) => {
+              const identity = identityById.get(row.identityId);
+              return (
+                <tr key={row.id}>
+                  <td>{identity?.title ?? "-"}</td>
+                  <td>{identity?.platform ?? "-"}</td>
+                  <td>{row.status}</td>
+                  <td>{row.memberId ?? "everyone"}</td>
+                </tr>
+              );
+            })}
+            {preview.library.length > topRows.length && (
+              <tr>
+                <td colSpan={4} className="text-xs text-zinc-500">
+                  Showing first {topRows.length} rows of {preview.library.length}.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
       </div>
-      <div>
-        <label className="text-xs text-zinc-500">Steam Web API Key</label>
-        <input className="input" placeholder="XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX" value={apiKey} onChange={(e) => setApiKey(e.target.value)} />
+
+      <label className="flex items-center gap-2 text-sm text-zinc-600">
+        <input
+          type="checkbox"
+          checked={autoStart}
+          onChange={(event) => onAutoStartChange(event.target.checked)}
+        />
+        Start desktop enrichment after import
+      </label>
+
+      <div className="flex justify-between pt-2">
+        <button type="button" className="btn-ghost" onClick={onBack} disabled={importing}>
+          Back
+        </button>
+        <button type="button" className="btn" onClick={onImport} disabled={importing}>
+          {importing ? "Importing…" : "Import rows"}
+        </button>
       </div>
-      <button className="btn" disabled={busy || !steamId || !apiKey}>
-        {busy ? "Fetching…" : "Fetch Library"}
-      </button>
-    </form>
+    </div>
   );
+}
+
+function EnrichStep({
+  pendingRows,
+  autoStart,
+  onStart,
+  onClose,
+  onReset,
+  snapshot,
+  pause,
+  resume,
+  cancel,
+}: {
+  pendingRows: EnrichRow[];
+  autoStart: boolean;
+  onStart: () => void;
+  onClose: () => void;
+  onReset: () => void;
+  snapshot: RunnerSnapshot;
+  pause: () => void;
+  resume: () => void;
+  cancel: () => void;
+}) {
+  const hasSession = Boolean(snapshot.sessionId);
+  const rowsQueued = snapshot.queue.length;
+  const rowsRemaining = snapshot.queue.filter(
+    (row) => row.status === "pending" || row.status === "paused" || row.status === "fetching",
+  ).length;
+  const readyToStart = pendingRows.length > 0 && !hasSession;
+  const sessionActive = Boolean(snapshot.sessionId && !snapshot.finished);
+
+  useEffect(() => {
+    if (autoStart && pendingRows.length && !hasSession && isTauri) {
+      onStart();
+    }
+  }, [autoStart, pendingRows.length, hasSession, onStart]);
+
+  return (
+    <div className="space-y-4">
+      <section className="space-y-2">
+        <header className="flex items-center justify-between">
+          <h3 className="text-sm font-semibold text-zinc-800">Desktop enrichment</h3>
+          {!isTauri && (
+            <span className="rounded-full border border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-700">
+              Desktop-only
+            </span>
+          )}
+        </header>
+        {!hasSession && pendingRows.length > 0 && (
+          <p className="text-sm text-zinc-600">
+            {pendingRows.length} newly imported rows are ready for enrichment.
+          </p>
+        )}
+        {hasSession && (
+          <p className="text-sm text-zinc-600">
+            {rowsRemaining} of {rowsQueued} rows remaining. Manage the background runner here or hide the wizard.
+          </p>
+        )}
+        {!hasSession && !pendingRows.length && (
+          <p className="text-sm text-zinc-600">
+            No queued rows. You can close the wizard or start a new import.
+          </p>
+        )}
+
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            className="btn"
+            onClick={onStart}
+            disabled={!readyToStart || !isTauri}
+            title={isTauri ? "Start enrichment" : "Requires desktop build"}
+          >
+            Start enrichment
+          </button>
+          {hasSession && (
+            <>
+              <button
+                type="button"
+                className="btn-ghost"
+                onClick={() => (snapshot.paused ? resume() : pause())}
+                aria-pressed={snapshot.paused}
+              >
+                {snapshot.paused ? "Resume" : "Pause"}
+              </button>
+              <button type="button" className="btn-ghost" onClick={() => cancel()}>
+                Cancel
+              </button>
+            </>
+          )}
+          <button type="button" className="btn-ghost" onClick={onClose}>
+            Hide &amp; continue
+          </button>
+        </div>
+      </section>
+
+      <section className="space-y-2">
+        <header className="flex items-center justify-between text-sm font-semibold text-zinc-800">
+          <span>Progress</span>
+          <span className="text-xs font-normal text-zinc-500">
+            {snapshot.completedCount} / {snapshot.totalRows}
+          </span>
+        </header>
+        {snapshot.queue.length === 0 ? (
+          <div className="rounded-md border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-600">
+            No enrichment session active.
+          </div>
+        ) : (
+          <div className="max-h-52 overflow-auto rounded-md border border-zinc-200">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Title</th>
+                  <th>Status</th>
+                  <th>Notes</th>
+                </tr>
+              </thead>
+              <tbody>
+                {snapshot.queue.map((row) => (
+                  <tr key={row.id}>
+                    <td>{row.title}</td>
+                    <td>
+                      <StatusChip status={row.status} />
+                    </td>
+                    <td className="text-xs text-zinc-500">
+                      {row.message ?? "\u2014"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      <section className="space-y-2">
+        <header className="text-sm font-semibold text-zinc-800">Latest items</header>
+        {snapshot.recent.length === 0 ? (
+          <p className="text-sm text-zinc-600">No items enriched yet.</p>
+        ) : (
+          <ul className="space-y-1" aria-live="polite">
+            {snapshot.recent.map((item) => (
+              <li
+                key={`${item.id}-${item.finishedAt}`}
+                className="flex items-center justify-between rounded-md border border-zinc-200 bg-white px-3 py-2 text-sm"
+              >
+                <span className="truncate">{item.title}</span>
+                <span className="text-xs text-zinc-500">
+                  {item.currencyCode && item.price != null
+                    ? `${item.currencyCode} ${item.price}`
+                    : ""}
+                  {item.ttb != null ? ` · ${item.ttb}h` : ""}
+                  {item.ocScore != null ? ` · OC ${item.ocScore}` : ""}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <div className="flex justify-between border-t border-zinc-200 pt-3">
+        <button
+          type="button"
+          className="btn-ghost"
+          onClick={onReset}
+          disabled={sessionActive}
+          title={
+            sessionActive
+              ? "Cancel or finish the running session before resetting."
+              : "Reset the wizard to start a fresh import."
+          }
+        >
+          Start over
+        </button>
+        <button
+          type="button"
+          className="btn"
+          onClick={onClose}
+          disabled={sessionActive}
+          title={
+            sessionActive
+              ? "Runner active in background. Use Hide to continue browsing."
+              : "Close wizard"
+          }
+        >
+          Done
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function StatusChip({ status }: { status: EnrichStatus }) {
+  const label = statusLabel(status);
+  return (
+    <span
+      className={`enrich-chip enrich-chip--${status}`}
+      aria-label={label}
+      role="status"
+    >
+      {label}
+    </span>
+  );
+}
+
+function statusLabel(status: EnrichStatus) {
+  switch (status) {
+    case "pending":
+      return "Pending";
+    case "fetching":
+      return "Fetching";
+    case "paused":
+      return "Paused";
+    case "done":
+      return "Done";
+    case "skipped":
+      return "Skipped";
+    case "error":
+      return "Error";
+    default:
+      return status;
+  }
+}
+
+function guessFieldMap(rows: IncomingRow[]): FieldMap {
+  if (!rows.length) return {};
+  const columns = Array.from(
+    new Set(rows.flatMap((row) => Object.keys(row).map((key) => key.trim()))),
+  );
+  const find = (...patterns: RegExp[]) => {
+    return (
+      columns.find((col) => patterns.some((re) => re.test(col.toLowerCase()))) ?? undefined
+    );
+  };
+  return {
+    title: find(/title/, /name/, /game/),
+    platform: find(/platform/, /system/),
+    status: find(/status/, /state/),
+    memberId: find(/member/, /player/, /profile/),
+    accountId: find(/account/, /store/, /service/),
+    priceTRY: find(/price/, /cost/),
+    acquiredAt: find(/acquired/, /added/, /date/),
+    ocScore: find(/opencritic/, /critic/, /score/),
+    ttbMedianMainH: find(/ttb/, /howlong/, /main/),
+    services: find(/service/, /subscription/, /tag/),
+  };
 }

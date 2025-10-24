@@ -7,7 +7,9 @@ export type Identity = {
   platform?: string;
   appid?: number;          // Steam app id
   igdbCoverId?: string;    // IGDB image id like "co123456"
-  ttbSource?: "hltb" | "hltb-cache" | "igdb" | "manual";
+  ttbSource?: "hltb" | "hltb-cache" | "html" | "igdb" | "manual";
+  ttbMedianMainH?: number | null;
+  ocScore?: number | null;
 };
 
 export type LibraryItem = {

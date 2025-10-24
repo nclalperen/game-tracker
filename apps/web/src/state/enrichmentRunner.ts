@@ -71,6 +71,15 @@ class EnrichmentRunner {
   private phase: RunnerPhase = "idle";
   private initStartedAt: number | null = null;
   private pendingActiveTimer: ReturnType<typeof setTimeout> | null = null;
+  // Simple client-side rate budgets and in-memory OC LRU
+  private rateMs = { steam: 600, hltb: 900, oc: 900 } as const;
+  private nextAllowedAt: Record<"steam" | "hltb" | "oc", number> = {
+    steam: 0,
+    hltb: 0,
+    oc: 0,
+  };
+  private ocLRU = new Map<string, number>();
+  private ocLRUMax = 200;
   private snapshot: RunnerSnapshot = this.buildSnapshot();
 
   constructor() {
@@ -305,6 +314,13 @@ class EnrichmentRunner {
     });
   }
 
+  private async awaitBudget(service: "steam" | "hltb" | "oc") {
+    const now = Date.now();
+    const wait = Math.max(0, this.nextAllowedAt[service] - now);
+    if (wait > 0) await sleep(wait);
+    this.nextAllowedAt[service] = Date.now() + this.rateMs[service];
+  }
+
   private async runRow(row: InternalRow): Promise<"done" | "paused"> {
     if (!this.sessionId) return "paused";
     if (this.paused) {
@@ -326,9 +342,10 @@ class EnrichmentRunner {
 
     // Steam price
     if (row.appid) {
-      const steam = await this.tryWithRetries("steam", row, () =>
-        fetchSteamPrice(row.appid!, this.region),
-      );
+      const steam = await this.tryWithRetries("steam", row, async () => {
+        await this.awaitBudget("steam");
+        return fetchSteamPrice(row.appid!, this.region);
+      });
       if (steam.kind === "paused") {
         row.status = "paused";
         row.updatedAt = Date.now();
@@ -363,7 +380,10 @@ class EnrichmentRunner {
     }
 
     // HowLongToBeat
-    const hltb = await this.tryWithRetries("hltb", row, () => fetchHLTB(row.title));
+    const hltb = await this.tryWithRetries("hltb", row, async () => {
+      await this.awaitBudget("hltb");
+      return fetchHLTB(row.title);
+    });
     if (hltb.kind === "paused") {
       row.status = "paused";
       row.updatedAt = Date.now();
@@ -398,7 +418,17 @@ class EnrichmentRunner {
     }
 
     // OpenCritic
-    const oc = await this.tryWithRetries("oc", row, () => fetchOpenCriticScore(row.title));
+    const oc = await this.tryWithRetries("oc", row, async () => {
+      // Skip request if identity already has a score or cached in-session
+      try {
+        const ident = await db.identities.get(row.identityId);
+        if (ident?.ocScore != null) return ident.ocScore as any;
+      } catch {}
+      const norm = normalizeTitleKey(row.title);
+      if (this.ocLRU.has(norm)) return this.ocLRU.get(norm)! as any;
+      await this.awaitBudget("oc");
+      return fetchOpenCriticScore(row.title);
+    });
     if (oc.kind === "paused") {
       row.status = "paused";
       row.updatedAt = Date.now();
@@ -409,9 +439,15 @@ class EnrichmentRunner {
       if (oc.value != null) {
         row.ocScore = Math.round(oc.value);
         try {
-          await db.library.update(row.id, { ocScore: row.ocScore } as any);
+          await db.identities.update(row.identityId, { ocScore: row.ocScore } as any);
         } catch (_err) {
           // Ignore Dexie write errors.
+        }
+        const norm = normalizeTitleKey(row.title);
+        this.ocLRU.set(norm, row.ocScore);
+        if (this.ocLRU.size > this.ocLRUMax) {
+          const first = this.ocLRU.keys().next().value as string | undefined;
+          if (first) this.ocLRU.delete(first);
         }
       } else {
         appendMessage(row, "OpenCritic: not found.");
@@ -580,6 +616,16 @@ function sleep(ms: number) {
   });
 }
 
+function normalizeTitleKey(s: string) {
+  return s
+    .toLowerCase()
+    .replace(/[™®©]/g, "")
+    .replace(/[:;—–,.]/g, " ")
+    .replace(/[\[\]()"']/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 const runner = new EnrichmentRunner();
 
 export function useEnrichmentRunner() {
@@ -601,3 +647,4 @@ export function useEnrichmentRunner() {
 export function getEnrichmentRunner() {
   return runner;
 }
+

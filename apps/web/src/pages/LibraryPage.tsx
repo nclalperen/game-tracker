@@ -1,14 +1,11 @@
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { db } from "@/db";
 import ImportWizard from "@/components/ImportWizard";
 import Modal from "@/components/Modal";
 import GameCover from "@/components/GameCover";
-import { useHLTB } from "@/hooks/useHLTB";
-import { useOpenCritic } from "@/hooks/useOpenCritic";
 import { useIGDB } from "@/hooks/useIGDB";
-// Desktop bridge (used only for Steam price in this page)
-import { fetchSteamPrice } from "@/desktop/bridge";
+import { isTauri, fetchHLTB, fetchSteamPrice, fetchOpenCriticScore } from "@/desktop/bridge";
 
 import {
   pricePerHour,
@@ -133,33 +130,66 @@ export default function LibraryPage() {
   // Editor
   const [editing, setEditing] = useState<Row | null>(null);
 
+  const [toast, setToast] = useState<string | null>(null);
+  const toastTimeoutRef = useRef<number | null>(null);
+
+  const showToast = useCallback((message: string) => {
+    setToast(message);
+  }, []);
+
+  useEffect(() => {
+    if (!toast) return;
+    if (toastTimeoutRef.current !== null) {
+      window.clearTimeout(toastTimeoutRef.current);
+      toastTimeoutRef.current = null;
+    }
+    toastTimeoutRef.current = window.setTimeout(() => {
+      setToast(null);
+      toastTimeoutRef.current = null;
+    }, 4000);
+    return () => {
+      if (toastTimeoutRef.current !== null) {
+        window.clearTimeout(toastTimeoutRef.current);
+        toastTimeoutRef.current = null;
+      }
+    };
+  }, [toast]);
+
   useEffect(() => {
     const handle = window.setTimeout(() => setSearchText(searchDraft.trim()), 150);
     return () => window.clearTimeout(handle);
   }, [searchDraft]);
 
+  const loadRows = useCallback(async () => {
+    const [idents, accs, mems, libs] = await Promise.all([
+      db.identities.toArray(),
+      db.accounts.toArray(),
+      db.members.toArray(),
+      db.library.toArray(),
+    ]);
+    const identById = new Map(idents.map((i) => [i.id, i] as const));
+    const accById = new Map(accs.map((a) => [a.id, a] as const));
+    const memById = new Map(mems.map((m) => [m.id, m] as const));
+
+    setMembers(mems);
+
+    const joined: Row[] = libs.map((li) => ({
+      ...li,
+      identity: identById.get(li.identityId),
+      account: li.accountId ? accById.get(li.accountId) : undefined,
+      member: li.memberId ? memById.get(li.memberId) : undefined,
+    }));
+    setRows(joined);
+  }, []);
+
   useEffect(() => {
-    (async () => {
-      const [idents, accs, mems, libs] = await Promise.all([
-        db.identities.toArray(),
-        db.accounts.toArray(),
-        db.members.toArray(),
-        db.library.toArray(),
-      ]);
-      const identById = new Map(idents.map((i) => [i.id, i] as const));
-      const accById = new Map(accs.map((a) => [a.id, a] as const));
-      const memById = new Map(mems.map((m) => [m.id, m] as const));
+    void loadRows();
+  }, [loadRows]);
 
-      setMembers(mems);
-
-      const joined: Row[] = libs.map((li) => ({
-        ...li,
-        identity: identById.get(li.identityId),
-        account: li.accountId ? accById.get(li.accountId) : undefined,
-        member: li.memberId ? memById.get(li.memberId) : undefined,
-      }));
-      setRows(joined);
-    })();
+  useEffect(() => {
+    const handler: EventListener = () => setWizardOpen(true);
+    window.addEventListener("gt:show-enrichment", handler);
+    return () => window.removeEventListener("gt:show-enrichment", handler);
   }, []);
 
   const filtered = useMemo(() => {
@@ -207,9 +237,10 @@ export default function LibraryPage() {
   }
 
   return (
-    <div className="space-y-4">
-      {/* Toolbar */}
-      <div className="flex items-center gap-2">
+    <>
+      <div className="space-y-4">
+        {/* Toolbar */}
+        <div className="flex items-center gap-2">
         <select
           className="select"
           value={memberFilter}
@@ -321,7 +352,7 @@ export default function LibraryPage() {
                       return `${sym} ${pph}`;
                     })()}
                   </td>
-                  <td className="px-2 py-1">{row.ocScore ?? "-"}</td>
+                  <td className="px-2 py-1">{row.identity?.ocScore ?? "-"}</td>
                   <td className="px-2 py-1">{row.acquiredAt ?? "-"}</td>
                   <td className="px-2 py-1">
                     <button className="btn-ghost" onClick={() => setEditing(row)}>
@@ -343,11 +374,21 @@ export default function LibraryPage() {
       )}
 
       {/* Import Wizard */}
-      <ImportWizard open={wizardOpen} onClose={() => setWizardOpen(false)} />
+      <ImportWizard
+        open={wizardOpen}
+        onClose={() => setWizardOpen(false)}
+        onImported={loadRows}
+      />
 
       {/* Editor */}
-      <Editor row={editing} onClose={() => setEditing(null)} />
+      <Editor row={editing} onClose={() => setEditing(null)} onNotify={showToast} />
     </div>
+    {toast && (
+      <div className="fixed bottom-4 right-4 z-50 rounded-md bg-black/80 px-4 py-2 text-sm text-white shadow-lg">
+        {toast}
+      </div>
+    )}
+  </>
   );
 }
 
@@ -413,7 +454,7 @@ function CardGroup({
                 {currencyLabel}/h: {pph ?? "-"}
               </span>
               <span className="inline-block text-xs rounded bg-zinc-100 px-2 py-0.5">
-                OC: {best.ocScore ?? "-"}
+                OC: {best.identity?.ocScore ?? "-"}
               </span>
             </div>
 
@@ -434,27 +475,32 @@ function CardGroup({
 }
 
 /** ---------- Editor Modal ---------- */
-function Editor({ row, onClose }: { row: Row | null; onClose: () => void }) {
+function Editor({
+  row,
+  onClose,
+  onNotify,
+}: {
+  row: Row | null;
+  onClose: () => void;
+  onNotify: (message: string) => void;
+}) {
   const open = !!row;
   const current = row ?? null;
 
   const { enabled: igdbOn, fetchMeta } = useIGDB();
-  const { fetchScore } = useOpenCritic();
-  const { enabled: hltbOn, fetchTTB } = useHLTB();
-
-  const isTauri = typeof window !== "undefined" && Boolean((window as any).__TAURI_INTERNALS__);
 
   const [status, setStatus] = useState<Status>(current?.status ?? "Backlog");
   const [price, setPrice] = useState<number>(current?.priceTRY ?? 0);
   const [currency, setCurrency] = useState<string>(current?.currencyCode ?? "TRY");
   const [ttb, setTtb] = useState<number | null>(current?.ttbMedianMainH ?? null);
-  const [score, setScore] = useState<number | null>(current?.ocScore ?? null);
+  const [score, setScore] = useState<number | null>(current?.identity?.ocScore ?? null);
 
   const currentAppid = current?.identity?.appid ?? null;
   const [appidInput, setAppidInput] = useState<string>(currentAppid ? String(currentAppid) : "");
 
   const [busyTTB, setBusyTTB] = useState(false);
   const [busyPrice, setBusyPrice] = useState(false);
+  const [busyOpenCritic, setBusyOpenCritic] = useState(false);
 
   useEffect(() => {
     if (current) {
@@ -462,7 +508,7 @@ function Editor({ row, onClose }: { row: Row | null; onClose: () => void }) {
       setPrice(current.priceTRY ?? 0);
       setCurrency(current.currencyCode ?? "TRY");
       setTtb(current.ttbMedianMainH ?? null);
-      setScore(current.ocScore ?? null);
+      setScore(current.identity?.ocScore ?? null);
     }
   }, [current?.id]);
 
@@ -472,8 +518,13 @@ function Editor({ row, onClose }: { row: Row | null; onClose: () => void }) {
 
   if (!open || !current) return null;
 
-  const ocEnabled = flags.openCriticEnabled || localStorage.getItem("oc_enabled") === "1";
-  const ocDisabled = !ocEnabled;
+  const openCriticPref = typeof window !== "undefined" ? localStorage.getItem("oc_enabled") === "1" : false;
+  const openCriticAvailable = flags.openCriticEnabled || openCriticPref;
+  const ocDisabled = !isTauri || !openCriticAvailable || busyOpenCritic;
+
+  const hltbPref = typeof window !== "undefined" ? localStorage.getItem("hltb_enabled") === "1" : false;
+  const hltbEnabled = hltbPref || isTauri;
+  const hltbDisabled = !isTauri || !hltbEnabled || busyTTB;
 
   const currencyLabel = (code: string | null | undefined) => formatCurrency(code);
 
@@ -483,7 +534,7 @@ function Editor({ row, onClose }: { row: Row | null; onClose: () => void }) {
   };
 
   return (
-    <Modal open={open} title={`Edit: ${current.identity?.title || ""}`} onClose={onClose}>
+    <Modal open={open} title={`Edit: ${current.identity?.title ?? "Untitled"}`} onClose={onClose}>
       <form
         className="space-y-3"
         onSubmit={async (e) => {
@@ -494,8 +545,8 @@ function Editor({ row, onClose }: { row: Row | null; onClose: () => void }) {
             priceTRY: price,
             currencyCode: currency,
             ttbMedianMainH: ttb ?? undefined,
-            ocScore: score ?? undefined,
           } as any);
+
 
           let nextSource: Identity["ttbSource"] | undefined = current.identity?.ttbSource;
           if (ttb == null) {
@@ -503,7 +554,12 @@ function Editor({ row, onClose }: { row: Row | null; onClose: () => void }) {
           } else if (current.ttbMedianMainH !== ttb) {
             nextSource = "manual";
           }
-          await updateIdentity({ ttbSource: nextSource });
+
+          await updateIdentity({
+            ttbMedianMainH: ttb ?? undefined,
+            ttbSource: nextSource,
+            ocScore: score ?? undefined,
+          });
 
           onClose();
           location.reload();
@@ -513,11 +569,12 @@ function Editor({ row, onClose }: { row: Row | null; onClose: () => void }) {
           <div>
             <label className="text-xs text-zinc-500">Status</label>
             <select className="select" value={status} onChange={(e) => setStatus(e.target.value as Status)}>
-              {(["Backlog", "Playing", "Beaten", "Abandoned", "Wishlist", "Owned"] as Status[]).map((s) => (
-                <option key={s} value={s}>
-                  {s}
-                </option>
-              ))}
+              {["Backlog", "Playing", "Beaten", "Abandoned", "Wishlist", "Owned"]
+                .map((s) => (
+                  <option key={s} value={s}>
+                    {s}
+                  </option>
+                ))}
             </select>
           </div>
 
@@ -556,47 +613,71 @@ function Editor({ row, onClose }: { row: Row | null; onClose: () => void }) {
           <button
             type="button"
             className="btn"
-            disabled={!igdbOn}
-            title={!igdbOn ? "IGDB integration is disabled" : "Fetch IGDB metadata (mock)"}
+            disabled={ocDisabled}
+            title={!isTauri ? "Desktop-only" : !openCriticAvailable ? "OpenCritic is disabled (feature flag)" : "Fetch OpenCritic score"}
             onClick={async () => {
               try {
-                if (!igdbOn) return;
-                const title = current.identity?.title || "";
-                if (!title) return alert("Missing title");
-                const meta = await fetchMeta(title);
-                if (meta.ttbMedianMainH != null) {
-                  setTtb(meta.ttbMedianMainH);
-                  await db.library.update(current.id, { ttbMedianMainH: meta.ttbMedianMainH } as any);
-                  await updateIdentity({ ttbSource: "igdb" });
+                setBusyOpenCritic(true);
+                const title = current.identity?.title?.trim();
+                if (!title) {
+                  onNotify("Missing title to fetch OpenCritic score.");
+                  return;
                 }
-                if (meta.igdbCoverId) {
-                  await updateIdentity({ igdbCoverId: meta.igdbCoverId });
+                const value = await fetchOpenCriticScore(title);
+                const rounded = value != null ? Math.round(value) : null;
+                if (rounded == null) {
+                  onNotify("OpenCritic: not found after retries.");
+                } else {
+                  setScore(rounded);
+                  await updateIdentity({ ocScore: rounded });
+                  onNotify(`OpenCritic score updated to ${rounded}.`);
                 }
               } catch (err: any) {
-                alert(err?.message || String(err));
+                onNotify(err?.message || "OpenCritic fetch failed.");
+              } finally {
+                setBusyOpenCritic(false);
               }
             }}
           >
-            Fetch IGDB
+            Fetch OpenCritic
           </button>
 
           <button
             type="button"
             className="btn"
-            disabled={ocDisabled}
-            title={ocDisabled ? "OpenCritic is disabled (feature flag)" : "Fetch OpenCritic score"}
+            disabled={hltbDisabled}
+            title={!isTauri ? "Desktop-only" : !hltbEnabled ? "Enable HLTB integration in settings" : "Fetch HowLongToBeat (main median)"}
             onClick={async () => {
               try {
-                const title = current.identity?.title || "";
-                if (!title) return alert("Missing title");
-                const res = await fetchScore(title);
-                setScore(res?.ocScore ?? null);
+                setBusyTTB(true);
+                const title = current.identity?.title?.trim();
+                if (!title) {
+                  onNotify("Missing title to fetch HowLongToBeat.");
+                  return;
+                }
+                const meta = await fetchHLTB(title);
+                const hours = meta.mainMedianHours ?? null;
+                if (hours != null) {
+                  setTtb(hours);
+                  await db.library.update(current.id, {
+                    ttbMedianMainH: hours,
+                  } as any);
+                  await updateIdentity({
+                    ttbMedianMainH: hours,
+                    ttbSource: meta.source,
+                  });
+                  onNotify("HowLongToBeat updated.");
+                } else {
+                  onNotify("HowLongToBeat: not found after retries.");
+                }
               } catch (err: any) {
-                alert(err?.message || String(err));
+                onNotify(err?.message || "HowLongToBeat fetch failed.");
+              } finally {
+                setBusyTTB(false);
               }
             }}
           >
-            Fetch OpenCritic
+            Fetch HLTB / TTB
           </button>
         </div>
 
@@ -604,30 +685,35 @@ function Editor({ row, onClose }: { row: Row | null; onClose: () => void }) {
           <button
             type="button"
             className="btn"
-            disabled={!hltbOn || busyTTB}
-            title={!hltbOn ? "Desktop-only (Tauri)" : "Fetch HowLongToBeat (main median)"}
+            disabled={!igdbOn}
+            title={!igdbOn ? "IGDB integration disabled" : "Fetch IGDB metadata (mock)"}
             onClick={async () => {
               try {
-                setBusyTTB(true);
-                const title = current.identity?.title || "";
-                if (!title) return alert("Missing title");
-                const meta = await fetchTTB(title);
-                if (meta.mainMedianHours != null) {
-                  setTtb(meta.mainMedianHours);
-                  await db.library.update(current.id, { ttbMedianMainH: meta.mainMedianHours } as any);
-                  const src = meta.source === "hltb-cache" ? "hltb-cache" : "hltb";
-                  await updateIdentity({ ttbSource: src });
-                } else {
-                  alert("No HLTB result.");
+                if (!igdbOn) {
+                  onNotify("IGDB integration is disabled.");
+                  return;
                 }
+                const title = current.identity?.title || "";
+                if (!title) {
+                  onNotify("Missing title to fetch IGDB metadata.");
+                  return;
+                }
+                const meta = await fetchMeta(title);
+                if (meta.ttbMedianMainH != null) {
+                  setTtb(meta.ttbMedianMainH);
+                  await db.library.update(current.id, { ttbMedianMainH: meta.ttbMedianMainH } as any);
+                  await updateIdentity({ ttbMedianMainH: meta.ttbMedianMainH, ttbSource: "igdb" });
+                }
+                if (meta.igdbCoverId) {
+                  await updateIdentity({ igdbCoverId: meta.igdbCoverId });
+                }
+                onNotify("IGDB metadata updated.");
               } catch (err: any) {
-                alert(err?.message || String(err));
-              } finally {
-                setBusyTTB(false);
+                onNotify(err?.message || "IGDB fetch failed.");
               }
             }}
           >
-            Fetch HLTB / TTB
+            Fetch IGDB
           </button>
 
           <div />
@@ -650,7 +736,10 @@ function Editor({ row, onClose }: { row: Row | null; onClose: () => void }) {
             }
             onClick={async () => {
               try {
-                if (!currentAppid) return alert("This game has no Steam appid.");
+                if (!currentAppid) {
+                  onNotify("This game has no Steam appid.");
+                  return;
+                }
                 setBusyPrice(true);
                 const prefs = [
                   (localStorage.getItem("steam_cc") || "us").toLowerCase(),
@@ -673,14 +762,15 @@ function Editor({ row, onClose }: { row: Row | null; onClose: () => void }) {
                   if (result) break;
                 }
                 if (!result) {
-                  alert("No price available for this or fallback regions.");
+                  onNotify("Steam price: not found after retries.");
                   return;
                 }
                 setPrice(result.price);
                 setCurrency(result.currency);
                 await db.library.update(current.id, { priceTRY: result.price, currencyCode: result.currency } as any);
+                onNotify("Steam price updated.");
               } catch (err: any) {
-                alert(err?.message || String(err));
+                onNotify(err?.message || "Steam price fetch failed.");
               } finally {
                 setBusyPrice(false);
               }
@@ -702,11 +792,17 @@ function Editor({ row, onClose }: { row: Row | null; onClose: () => void }) {
               className="btn-ghost"
               onClick={async () => {
                 const parsed = parseAppId(appidInput);
-                if (!parsed) return alert("Enter a valid appid or Steam app URL.");
-                if (!current.identity?.id) return alert("Missing identity.");
+                if (!parsed) {
+                  onNotify("Enter a valid appid or Steam app URL.");
+                  return;
+                }
+                if (!current.identity?.id) {
+                  onNotify("Missing identity.");
+                  return;
+                }
                 await db.identities.update(current.identity.id, { appid: parsed } as any);
                 setAppidInput("");
-                alert(`Saved appid ${parsed}. You can now fetch price.`);
+                onNotify(`Saved appid ${parsed}. You can now fetch price.`);
                 location.reload();
               }}
               disabled={!appidInput || String(currentAppid ?? "") === appidInput.trim()}
@@ -726,7 +822,7 @@ function Editor({ row, onClose }: { row: Row | null; onClose: () => void }) {
               type="button"
               className="btn bg-red-600 hover:bg-red-700"
               onClick={async () => {
-                if (!confirm(`Delete this entry: "${current.identity?.title}"`)) return;
+                if (!confirm(`Delete this entry: "${current.identity?.title ?? "Untitled"}"?`)) return;
                 await db.library.delete(current.id);
                 onClose();
                 location.reload();
@@ -753,3 +849,14 @@ function pickBestEntry(entries: Row[]): Row {
     return sa - sb;
   })[0] || entries[0]);
 }
+
+
+
+
+
+
+
+
+
+
+
