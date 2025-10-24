@@ -1,7 +1,6 @@
 import { flags } from "@tracker/core";
 
 type MetaResult = {
-  ttbMedianMainH?: number | null;
   igdbCoverId?: string | null;
 };
 
@@ -14,14 +13,13 @@ export function useIGDB() {
   const enabled = override || !!(flags as any).igdbEnabled;
 
   async function fetchMeta(title: string): Promise<MetaResult> {
-    if (!enabled) return { ttbMedianMainH: null, igdbCoverId: null };
+    if (!enabled) return { igdbCoverId: null };
 
     // MOCK until real IGDB keys are added:
     const seed = title.trim().toLowerCase().length;
-    const ttb = Math.max(4, Math.min(60, seed * 2));
     const igdbCoverId = `co${100000 + seed * 137}`;
 
-    return { ttbMedianMainH: ttb, igdbCoverId };
+    return { igdbCoverId };
   }
 
   return { enabled, fetchMeta };

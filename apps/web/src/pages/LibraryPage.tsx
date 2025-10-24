@@ -699,15 +699,12 @@ function Editor({
                   return;
                 }
                 const meta = await fetchMeta(title);
-                if (meta.ttbMedianMainH != null) {
-                  setTtb(meta.ttbMedianMainH);
-                  await db.library.update(current.id, { ttbMedianMainH: meta.ttbMedianMainH } as any);
-                  await updateIdentity({ ttbMedianMainH: meta.ttbMedianMainH, ttbSource: "igdb" });
-                }
                 if (meta.igdbCoverId) {
                   await updateIdentity({ igdbCoverId: meta.igdbCoverId });
+                  onNotify("IGDB cover updated (mock).");
+                } else {
+                  onNotify("IGDB cover not available.");
                 }
-                onNotify("IGDB metadata updated.");
               } catch (err: any) {
                 onNotify(err?.message || "IGDB fetch failed.");
               }

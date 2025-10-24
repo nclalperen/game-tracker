@@ -188,7 +188,7 @@ export default function SettingsPage() {
         </label>
         <label className="flex items-center gap-3">
           <input type="checkbox" checked={igdbOn} onChange={(e) => setIgdbOn(e.target.checked)} />
-          <span>IGDB (TTB & cover id) - mocked until keys</span>
+          <span>IGDB covers (mock placeholder)</span>
         </label>
         <label className="flex items-center gap-3" title={(() => {
           try {
