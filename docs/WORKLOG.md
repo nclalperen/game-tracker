@@ -43,3 +43,11 @@ Local-first desktop and web app to ingest personal game libraries, enrich metada
 - 2025-02-24: Implemented a singleton enrichment runner with persisted sessions, minimal HUD overlay, and a hideable Import Wizard. Updated `ImportWizard.tsx`, `state/enrichmentRunner.ts`, `overlays/EnrichmentHUD.tsx`, and styling/Library hooks; verified via `pnpm build` (web) — noted existing Vite dynamic import warning. Known limitation: Tauri bridge calls still lack abort support, so pause waits for the current request to settle.
 - 2025-02-24: Added runner `phase` lifecycle (`idle/init/active/paused/done`) with a 600ms minimum init window, shader-style init line (`gt-hud__init`) that swaps to progress fill (`gt-hud__prog`), and reduced-motion guard. `EnrichmentHUD` now reads `snapshot.phase` to switch lines while keeping popover controls unchanged.
 - 2025-02-24: Wired OpenCritic via RapidAPI: desktop command reads `OPENCRITIC_API_KEY`/`OPENCRITIC_HOST`, hits `/game/search` and `/game/{id}`, caches scores in `%AppData%/GameTracker/opencritic_cache.json` for 7 days, and backs off on 429 using `Retry-After` or a 700ms+jitter fallback.
+- 2025-02-25: Updated HLTB enrichment to use Next.js data endpoint with build-id cache and fuzzy matching fallback (apps/desktop/src-tauri/src/commands.rs:208).
+## HLTB � current state
+- Endpoint: POST https://howlongtobeat.com/api/search (fallback: HTML parse).
+- Payload: searchType=1, searchTerms tokens, page/size, options for games/users/filter (apps/desktop/src-tauri/src/commands.rs:223).
+- HTML fallback: GET https://howlongtobeat.com/?q=... and regex parse gameplayMain (apps/desktop/src-tauri/src/commands.rs:273).
+- Cache: %AppData%/GameTracker/hltb_cache.json, TTL: 30d for positive, 24h for negative (apps/desktop/src-tauri/src/commands.rs:17,19,324).
+- Returns: Ok(Some(hours)) on success; Ok(None) when not found; Err(String) on HTTP/parse errors.
+

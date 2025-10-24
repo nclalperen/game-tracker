@@ -17,12 +17,16 @@ use std::{
 const HLTB_CACHE_FILE: &str = "hltb_cache.json";
 const OPENCRITIC_CACHE_FILE: &str = "opencritic_cache.json";
 const HLTB_CACHE_TTL_SECS: i64 = 30 * 24 * 60 * 60;
+const HLTB_NEGATIVE_TTL_SECS: i64 = 24 * 60 * 60;
+const HLTB_BUILD_TTL_SECS: i64 = 24 * 60 * 60;
+const HLTB_BUILD_FILE: &str = "hltb_build.json";
 const OPENCRITIC_CACHE_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 const OPENCRITIC_MAX_RETRIES: usize = 5;
 const OPENCRITIC_BACKOFF_FALLBACK_MS: u64 = 700;
 const OPENCRITIC_NEGATIVE_TTL_SECS: i64 = 24 * 60 * 60; // 24h for not-found
 const DEFAULT_STEAM_REGION: &str = "us";
 const USER_AGENT: &str = "GameTracker/1.0 (+https://tracker.local)";
+const HLTB_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36";
 
 #[derive(Serialize)]
 pub struct HLTBMeta {
@@ -93,6 +97,31 @@ fn cache_path(name: &str) -> PathBuf {
 fn data_file(name: &str) -> PathBuf {
   cache_path(name)
 }
+
+fn read_json(path: &Path) -> Value {
+  if let Ok(bytes) = fs::read(path) {
+    serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null)
+  } else {
+    Value::Null
+  }
+}
+
+fn write_json(path: &Path, v: &Value) {
+  if let Some(parent) = path.parent() {
+    let _ = fs::create_dir_all(parent);
+  }
+  if let Ok(json) = serde_json::to_vec_pretty(v) {
+    let _ = fs::write(path, json);
+  }
+}
+
+static ACLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+  reqwest::Client::builder()
+    .user_agent(HLTB_UA)
+    .gzip(true)
+    .build()
+    .expect("hltb_client")
+});
 
 fn read_cache_map<T>(name: &str) -> HashMap<String, T>
 where
@@ -220,62 +249,150 @@ fn clear_cache_file(name: &str) -> Result<(), String> {
   Ok(())
 }
 
-async fn hltb_try_api(client: &reqwest::Client, title: &str) -> Result<Option<f32>, String> {
-  let terms: Vec<&str> = title.split_whitespace().collect();
-  let payload = serde_json::json!({
-    "searchType": 1,
-    "searchTerms": terms,
-    "searchPage": 1,
-    "size": 5,
-    "searchOptions": {
-      "games": {
-        "userId": 0,
-        "platform": "",
-        "sortCategory": "popular",
-        "rangeCategory": "main",
-        "rangeTime": "0",
-        "gameplay": "",
-        "modifier": ""
-      },
-      "users": { "sortCategory": "postcount" },
-      "filter": { "sort": 0 }
+async fn hltb_fetch_build_id() -> Result<String, String> {
+  let debug_h = std::env::var("DEBUG_HLTB").ok().as_deref() == Some("1");
+  let path = data_file(HLTB_BUILD_FILE);
+  if path.exists() {
+    let v = read_json(&path);
+    if let (Some(build), Some(ts)) = (v.get("build_id").and_then(|x| x.as_str()), v.get("ts").and_then(|x| x.as_i64())) {
+      if !is_expired(ts, HLTB_BUILD_TTL_SECS) {
+        if debug_h { eprintln!("DEBUG_HLTB: BUILD_CACHE_HIT {}", build); }
+        return Ok(build.to_string());
+      }
     }
-  });
-
-  let res = client
-    .post("https://howlongtobeat.com/api/search")
-    .header("origin", "https://howlongtobeat.com")
-    .header("referer", "https://howlongtobeat.com/")
-    .header("content-type", "application/json")
-    .json(&payload)
+  }
+  if debug_h { eprintln!("DEBUG_HLTB: BUILD_FETCH_START"); }
+  let html = ACLIENT
+    .get("https://howlongtobeat.com/")
     .send()
     .await
+    .map_err(|e| e.to_string())?
+    .text()
+    .await
     .map_err(|e| e.to_string())?;
-
-  if !res.status().is_success() {
-    return Err(format!("HLTB HTTP {}", res.status()));
+  let re = Regex::new(r#"<script[^>]*id=\"__NEXT_DATA__\"[^>]*>(.*?)</script>"#).unwrap();
+  if let Some(cap) = re.captures(&html) {
+    if let Some(m) = cap.get(1) {
+      if let Ok(json) = serde_json::from_str::<Value>(m.as_str()) {
+        if let Some(build) = json.get("buildId").and_then(|x| x.as_str()) {
+          let build = build.to_string();
+          let v = serde_json::json!({"build_id": build, "ts": now_unix()});
+          write_json(&path, &v);
+          if debug_h { eprintln!("DEBUG_HLTB: BUILD_FETCH_SUCCESS {}", build); }
+          return Ok(build);
+        }
+      }
+    }
   }
+  if debug_h { eprintln!("DEBUG_HLTB: BUILD_FETCH_FAIL"); }
+  Err("HLTB build id not found".into())
+}
 
-  #[derive(Deserialize)]
-  struct Item {
-    #[serde(rename = "gameplayMain")]
-    gameplay_main: Option<f32>,
+async fn hltb_fetch_search_json(build_id: &str, title: &str) -> Result<Value, String> {
+  let debug_h = std::env::var("DEBUG_HLTB").ok().as_deref() == Some("1");
+  let query = urlencoding::encode(title);
+  let url = format!("https://howlongtobeat.com/_next/data/{}/search.json?game={}&sort=popular", build_id, query);
+  let mut attempt = 0;
+  loop {
+    attempt += 1;
+    if debug_h { eprintln!("DEBUG_HLTB: API_REQ attempt={} url={}", attempt, url); }
+    let res = ACLIENT
+      .get(&url)
+      .header("referer", format!("https://howlongtobeat.com/?q={}", query))
+      .send()
+      .await
+      .map_err(|e| e.to_string())?;
+    if res.status() == StatusCode::TOO_MANY_REQUESTS {
+      if attempt >= 5 { return Err("HLTB 429 exhausted".into()); }
+      let wait = retry_after_duration(res.headers());
+      if debug_h { eprintln!("DEBUG_HLTB: HTTP_429 RETRY_AFTER={:?}", wait); }
+      thread::sleep(wait);
+      continue;
+    }
+    if res.status() == StatusCode::NOT_FOUND {
+      if debug_h { eprintln!("DEBUG_HLTB: OTHER_HTTP {}", res.status()); }
+      return Err("HLTB data 404".into());
+    }
+    if !res.status().is_success() {
+      if debug_h { eprintln!("DEBUG_HLTB: OTHER_HTTP {}", res.status()); }
+      return Err(format!("HLTB HTTP {}", res.status()));
+    }
+    return res.json::<Value>().await.map_err(|e| e.to_string());
   }
-  #[derive(Deserialize)]
-  struct ApiResp {
-    data: Vec<Item>,
-  }
+}
 
-  let body: ApiResp = res.json().await.map_err(|e| e.to_string())?;
-  Ok(body.data.get(0).and_then(|i| i.gameplay_main))
+fn collect_hltb_nodes(v: &Value, out: &mut Vec<(String, f32)>) {
+  match v {
+    Value::Object(map) => {
+      if let Some(main) = map.get("gameplayMain").and_then(|x| x.as_f64()) {
+        if main > 0.0 {
+          let name = map.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+          out.push((name, main as f32));
+        }
+      }
+      for child in map.values() {
+        collect_hltb_nodes(child, out);
+      }
+    }
+    Value::Array(arr) => {
+      for child in arr {
+        collect_hltb_nodes(child, out);
+      }
+    }
+    _ => {}
+  }
+}
+
+fn pick_best_hours(query: &str, pairs: &[(String, f32)]) -> Option<f32> {
+  let qn = normalize_title(query);
+  let mut best: (usize, f64, f32) = (usize::MAX, -1.0, 0.0);
+  for (i, (name, main)) in pairs.iter().enumerate() {
+    let nn = normalize_title(name);
+    let jw = jaro_winkler(&qn, &nn) as f64;
+    let jac = jaccard_token_set(&qn, &nn);
+    let score = jw.max(jac);
+    if *main > 0.0 && score > best.1 { best = (i, score, *main); }
+  }
+  if best.0 != usize::MAX && best.1 >= 0.85 { Some(best.2) } else { None }
+}
+
+async fn hltb_try_api(_client: &reqwest::Client, title: &str) -> Result<Option<f32>, String> {
+  let debug_h = std::env::var("DEBUG_HLTB").ok().as_deref() == Some("1");
+  let build_id = match hltb_fetch_build_id().await {
+    Ok(id) => id,
+    Err(e) => {
+      if debug_h { eprintln!("DEBUG_HLTB: BUILD_MISSING {}", e); }
+      return Ok(None);
+    }
+  };
+  let data = match hltb_fetch_search_json(&build_id, title).await {
+    Ok(v) => v,
+    Err(e) => {
+      if debug_h { eprintln!("DEBUG_HLTB: DATA_FETCH_FAIL {}", e); }
+      return Ok(None);
+    }
+  };
+  let mut nodes = Vec::new();
+  if let Some(games) = data
+    .get("pageProps")
+    .and_then(|p| p.get("data"))
+    .and_then(|d| d.get("games"))
+  {
+    collect_hltb_nodes(games, &mut nodes);
+  }
+  if debug_h { eprintln!("DEBUG_HLTB: API_MATCHES {}", nodes.len()); }
+  let picked = pick_best_hours(title, &nodes);
+  if debug_h { eprintln!("DEBUG_HLTB: API_SELECTED -> {:?}", picked); }
+  Ok(picked)
 }
 
 async fn hltb_try_html(client: &reqwest::Client, title: &str) -> Result<Option<f32>, String> {
+  let debug_h = std::env::var("DEBUG_HLTB").ok().as_deref() == Some("1");
   let q = urlencoding::encode(title);
   let url = format!("https://howlongtobeat.com/?q={}", q);
   let res = client
-    .get(url)
-    .header("user-agent", USER_AGENT)
+    .get(&url)
+    .header("user-agent", HLTB_UA)
     .send()
     .await
     .map_err(|e| e.to_string())?;
@@ -285,6 +402,28 @@ async fn hltb_try_html(client: &reqwest::Client, title: &str) -> Result<Option<f
   }
 
   let text = res.text().await.map_err(|e| e.to_string())?;
+  let mut nodes = Vec::new();
+  if let Ok(re) = Regex::new(r#"<script[^>]*id=\"__NEXT_DATA__\"[^>]*>(.*?)</script>"#) {
+    if let Some(cap) = re.captures(&text) {
+      if let Some(m) = cap.get(1) {
+        if let Ok(json) = serde_json::from_str::<Value>(m.as_str()) {
+          if let Some(games) = json
+            .get("props")
+            .and_then(|p| p.get("pageProps"))
+            .and_then(|p| p.get("data"))
+            .and_then(|d| d.get("games"))
+          {
+            collect_hltb_nodes(games, &mut nodes);
+          }
+        }
+      }
+    }
+  }
+  if debug_h { eprintln!("DEBUG_HLTB: HTML_JSON_MATCHES {}", nodes.len()); }
+  if let Some(hours) = pick_best_hours(title, &nodes) {
+    if debug_h { eprintln!("DEBUG_HLTB: HTML_SELECTED {:?}", hours); }
+    return Ok(Some(hours));
+  }
 
   if let Some(caps) = html_main_regex().captures(&text) {
     if let Some(mat) = caps.get(1) {
@@ -332,8 +471,11 @@ pub async fn hltb_search(title: String) -> Result<HLTBMeta, String> {
 
   let key = normalize_key(trimmed);
   let mut cache = read_cache_map::<HltbCacheEntry>(HLTB_CACHE_FILE);
+  let debug_h = std::env::var("DEBUG_HLTB").ok().as_deref() == Some("1");
   if let Some(entry) = cache.get(&key) {
-    if !is_expired(entry.ts, HLTB_CACHE_TTL_SECS) {
+    let ttl = if entry.value.is_some() { HLTB_CACHE_TTL_SECS } else { HLTB_NEGATIVE_TTL_SECS };
+    if !is_expired(entry.ts, ttl) {
+      if debug_h { eprintln!("DEBUG_HLTB: CACHE_HIT {} -> {:?}", &key, entry.value); }
       return Ok(HLTBMeta {
         main_median_hours: entry.value,
         source: "hltb-cache".into(),
@@ -342,7 +484,7 @@ pub async fn hltb_search(title: String) -> Result<HLTBMeta, String> {
   }
 
   let client = reqwest::Client::builder()
-    .user_agent(USER_AGENT)
+    .user_agent(HLTB_UA)
     .build()
     .map_err(|e| e.to_string())?;
 
@@ -366,7 +508,7 @@ pub async fn hltb_search(title: String) -> Result<HLTBMeta, String> {
 
   let fallback = hltb_try_html(&client, trimmed).await?;
   cache.insert(
-    key,
+    key.clone(),
     HltbCacheEntry {
       value: fallback,
       ts: now_unix(),
@@ -383,6 +525,11 @@ pub async fn hltb_search(title: String) -> Result<HLTBMeta, String> {
 #[tauri::command]
 pub fn hltb_clear_cache() -> Result<(), String> {
   clear_cache_file(HLTB_CACHE_FILE)
+}
+
+#[tauri::command]
+pub fn opencritic_clear_cache() -> Result<(), String> {
+  clear_cache_file(OPENCRITIC_CACHE_FILE)
 }
 
 #[tauri::command]
@@ -604,8 +751,3 @@ fn jaccard_token_set(a: &str, b: &str) -> f64 {
   let uni = ta.union(&tb).count() as f64;
   if uni == 0.0 { 0.0 } else { inter / uni }
 }
-
-
-
-
-
