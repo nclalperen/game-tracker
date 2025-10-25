@@ -181,8 +181,12 @@ export default function LibraryPage() {
   const [criticSourceFilter, setCriticSourceFilter] = useState<CriticSourceFilter>("any");
 
   // Sorting
-  const [sortField, setSortField] = useState<SortField>("title");
-  const [sortDirection, setSortDirection] = useState<SortDirection>("asc");
+  const [sortState, setSortState] = useState<{ field: SortField; direction: SortDirection }>({
+    field: "title",
+    direction: "asc",
+  });
+
+  const { field: sortField, direction: sortDirection } = sortState;
 
   // data for filters
   const [members, setMembers] = useState<Member[]>([]);
@@ -427,13 +431,14 @@ export default function LibraryPage() {
   }, [filtered]);
 
   const handleSort = useCallback((field: SortField) => {
-    setSortField((prevField) => {
-      if (prevField === field) {
-        setSortDirection((prevDir) => (prevDir === "asc" ? "desc" : "asc"));
-        return prevField;
+    setSortState((prev) => {
+      if (prev.field === field) {
+        return {
+          field,
+          direction: prev.direction === "asc" ? "desc" : "asc",
+        };
       }
-      setSortDirection("asc");
-      return field;
+      return { field, direction: "asc" };
     });
   }, []);
 
