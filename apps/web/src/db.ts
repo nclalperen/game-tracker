@@ -1,4 +1,4 @@
-import Dexie, { Table } from "dexie";
+﻿import Dexie, { Table } from "dexie";
 import type { Account, Identity, LibraryItem, Member } from "@tracker/core";
 
 /**
@@ -11,12 +11,36 @@ import type { Account, Identity, LibraryItem, Member } from "@tracker/core";
  *  - v4: move `ttbSource` onto identities
  *  - v5: add `currencyCode` to library rows
  */
+export type RawgStoreInfo = {
+  id: number;
+  name: string;
+  url?: string | null;
+};
+
+export type RawgGameCache = {
+  id: number;
+  slug: string;
+  title: string;
+  titleKey: string;
+  backgroundImage?: string | null;
+  genres: string[];
+  stores: RawgStoreInfo[];
+  playtimeHours?: number | null;
+  screenshotsCount?: number | null;
+  metacriticScore?: number | null;
+  rating?: number | null;
+  ratingTop?: number | null;
+  ratingsCount?: number | null;
+  aggregatedScore?: number | null;
+  updatedAtISO: string;
+};
 class GTDb extends Dexie {
   identities!: Table<Identity, string>;
   accounts!: Table<Account, string>;
   members!: Table<Member, string>;
   library!: Table<LibraryItem, string>;
   settings!: Table<{ key: string; value: unknown }, string>;
+  rawgGames!: Table<RawgGameCache, number>;
 
   constructor() {
     super("game-tracker");
@@ -130,11 +154,38 @@ class GTDb extends Dexie {
       settings: "key",
     });
 
+    // ---------- v7: add Metacritic fields ----------
+    this.version(7).stores({
+      identities: "id, title, platform, appid, igdbCoverId, ttbSource, ttbMedianMainH, mcScore, mcUserScore, mcGenres",
+      accounts: "id, label, platform",
+      members: "id, name",
+      library: "id, identityId, accountId, memberId, status, acquiredAt, currencyCode",
+      settings: "key",
+    }).upgrade(async (tx) => {
+      const identTable = tx.table("identities");
+      await identTable.toCollection().modify((row: any) => {
+        if (typeof row.mcScore === "undefined") row.mcScore = undefined;
+        if (typeof row.mcUserScore === "undefined") row.mcUserScore = undefined;
+        if (typeof row.mcGenres === "undefined") row.mcGenres = undefined;
+      });
+    });
+
+    // ---------- v8: add RAWG cache ----------
+    this.version(8).stores({
+      identities: "id, title, platform, appid, igdbCoverId, ttbSource, ttbMedianMainH, mcScore, mcUserScore, mcGenres",
+      accounts: "id, label, platform",
+      members: "id, name",
+      library: "id, identityId, accountId, memberId, status, acquiredAt, currencyCode",
+      settings: "key",
+      rawgGames: "id, slug, titleKey",
+    });
+
     this.identities = this.table("identities");
     this.accounts = this.table("accounts");
     this.members = this.table("members");
     this.library = this.table("library");
     this.settings = this.table("settings");
+    this.rawgGames = this.table("rawgGames");
   }
 }
 
@@ -160,7 +211,10 @@ export type EnrichRowSnapshot = {
   ttb?: number | null;
   ttbSource?: Identity["ttbSource"];
   ocScore?: number | null;
+  mcScore?: number | null;
+  criticScoreSource?: Identity["criticScoreSource"];
   message?: string | null;
+  stage?: "vendor" | "fallback";
 };
 
 export type EnrichRowSummary = {
@@ -170,7 +224,10 @@ export type EnrichRowSummary = {
   price?: number | null;
   currencyCode?: string | null;
   ttb?: number | null;
+  ttbSource?: Identity["ttbSource"];
   ocScore?: number | null;
+  mcScore?: number | null;
+  criticScoreSource?: Identity["criticScoreSource"];
 };
 
 export type EnrichSession = {
@@ -185,20 +242,48 @@ export type EnrichSession = {
   recent: EnrichRowSummary[];
   phase?: "idle" | "init" | "active" | "paused" | "done";
 };
+export function isRawgGameStale(game: RawgGameCache, maxAgeDays = 30): boolean {
+  const updated = Date.parse(game.updatedAtISO);
+  if (!Number.isFinite(updated)) return true;
+  const ageMs = Date.now() - updated;
+  const maxMs = maxAgeDays * 24 * 60 * 60 * 1000;
+  return ageMs > maxMs;
+}
 
+export async function getRawgGame(id: number): Promise<RawgGameCache | undefined> {
+  return db.rawgGames.get(id);
+}
+
+export async function getRawgGameByTitleKey(titleKey: string): Promise<RawgGameCache | undefined> {
+  return db.rawgGames.where("titleKey").equals(titleKey).first();
+}
+
+export async function upsertRawgGame(game: RawgGameCache): Promise<void> {
+  const existing = await db.rawgGames.get(game.id);
+  const merged: RawgGameCache = existing
+    ? {
+        ...existing,
+        ...game,
+        updatedAtISO: game.updatedAtISO || existing.updatedAtISO,
+      }
+    : {
+        ...game,
+        updatedAtISO: game.updatedAtISO || new Date().toISOString(),
+      };
+  await db.rawgGames.put(merged);
+}
 /** Clear all app data (used by the "Clear Profile" button). */
 export async function clearAllData() {
   await db.transaction(
     "rw",
-    db.members,
-    db.accounts,
-    db.identities,
-    db.library,
+    [db.members, db.accounts, db.identities, db.library, db.settings, db.rawgGames],
     async () => {
       await db.members.clear();
       await db.accounts.clear();
       await db.identities.clear();
       await db.library.clear();
+      await db.settings.clear();
+      await db.rawgGames.clear();
     },
   );
 }
@@ -207,10 +292,7 @@ export async function clearAllData() {
 export async function withRW<T>(fn: () => Promise<T>) {
   return db.transaction(
     "rw",
-    db.members,
-    db.accounts,
-    db.identities,
-    db.library,
+    [db.members, db.accounts, db.identities, db.library, db.settings, db.rawgGames],
     fn,
   );
 }
@@ -230,4 +312,15 @@ export async function setEnrichSession(session: EnrichSession) {
 export async function clearEnrichSession() {
   await db.settings.delete(ENRICH_SESSION_KEY);
 }
+
+
+
+
+
+
+
+
+
+
+
 

@@ -7,9 +7,13 @@ export type Identity = {
   platform?: string;
   appid?: number;          // Steam app id
   igdbCoverId?: string;    // IGDB image id like "co123456"
-  ttbSource?: "hltb" | "hltb-cache" | "html" | "igdb" | "manual";
+  ttbSource?: "hltb" | "hltb-cache" | "html" | "igdb" | "manual" | "hltb-local" | "rawg";
   ttbMedianMainH?: number | null;
   ocScore?: number | null;
+  mcScore?: number | null;
+  mcUserScore?: number | null;
+  mcGenres?: string[];
+  criticScoreSource?: "metacritic" | "opencritic" | "rawg";
 };
 
 export type LibraryItem = {
@@ -23,6 +27,7 @@ export type LibraryItem = {
   acquiredAt?: string;
   services?: string[];
   ocScore?: number;
+  mcScore?: number;
   ttbMedianMainH?: number;
 };
 

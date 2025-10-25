@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+﻿import { useEffect } from "react";
 import { Outlet, NavLink } from "react-router-dom";
 import { ensureSeed } from "@/utils/seed";
 import EnrichmentHUD from "@/overlays/EnrichmentHUD";

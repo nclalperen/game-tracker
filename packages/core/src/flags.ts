@@ -1,4 +1,4 @@
-export const flags = {
+﻿export const flags = {
 openCriticEnabled: true,
 igdbEnabled: true,
 steamPriceFetchEnabled: true, // desktop only later

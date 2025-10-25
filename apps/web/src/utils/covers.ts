@@ -1,4 +1,4 @@
-import type { Identity } from "@tracker/core";
+﻿import type { Identity } from "@tracker/core";
 
 /**
  * Build a prioritized list of candidate image URLs for a game.

@@ -1,4 +1,4 @@
-import { flags } from "@tracker/core";
+﻿import { flags } from "@tracker/core";
 
 type MetaResult = {
   igdbCoverId?: string | null;

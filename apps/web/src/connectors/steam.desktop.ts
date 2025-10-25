@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+﻿import { invoke } from "@tauri-apps/api/core";
 
 export async function fetchSteamOwnedGamesNative(steamId64: string, apiKey: string) {
   return await invoke<any[]>("get_owned_games", { steamApiKey: apiKey, steamid64: steamId64 });

@@ -1,4 +1,4 @@
-let isTauri = false;
+﻿let isTauri = false;
 try {
   isTauri = typeof (window as any).__TAURI__ !== "undefined";
 } catch {}

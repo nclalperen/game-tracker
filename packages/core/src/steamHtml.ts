@@ -1,4 +1,4 @@
-export type SteamHtmlRow = { appid: number; name: string };
+﻿export type SteamHtmlRow = { appid: number; name: string };
 
 
 export function parseSteamAllGamesHTML(html: string): SteamHtmlRow[] {

@@ -1,4 +1,4 @@
-import { parseCSV } from "./csv";
+﻿import { parseCSV } from "./csv";
 import type { LibraryItem, Identity, Platform, Status } from "./types";
 import { nanoid } from "./uid";
 import { normalizePlatform, normalizeStatus } from "./normalize";
@@ -23,9 +23,19 @@ export function readCSV(text: string) {
 
 export function extractTitle(s: string): string {
   if (!s) return "";
-  // strip any URLs (e.g., Steam links) first
-  const withoutUrl = s.replace(/https?:\/\/\S+/g, "").trim();
-  // take the part before common separators (":", "–", "—", "-")
+  const trimmed = s.trim();
+  const lower = trimmed.toLowerCase();
+  const httpIndex = lower.indexOf("http");
+  if (httpIndex > 0 && lower.includes("store.steampowered.com")) {
+    const beforeUrl = trimmed
+      .slice(0, httpIndex)
+      .replace(/[\s:|\u2013|\u2014-]+$/, "")
+      .trim();
+    if (beforeUrl) {
+      return beforeUrl;
+    }
+  }
+  const withoutUrl = trimmed.replace(/https?:\/\/\S+/g, "").trim();
   const first = withoutUrl.split(/\s*[:|\u2013|\u2014|-]\s*/)[0]?.trim();
   return first || withoutUrl;
 }
@@ -58,8 +68,20 @@ export function rowsToEntities(rows: IncomingRow[], map: FieldMap) {
   const library: LibraryItem[] = [];
   const idByKey = new Map<string, string>();
   const identityById = new Map<string, Identity>(); // keep reference to update existing
+  const requiresSteamStoreLink = rows.some((row) =>
+    Object.values(row).some(
+      (value) => typeof value === "string" && value.includes("store.steampowered.com"),
+    ),
+  );
 
   for (const r of rows) {
+    const hasSteamStoreLink = Object.values(r).some(
+      (value) => typeof value === "string" && value.includes("store.steampowered.com"),
+    );
+    if (requiresSteamStoreLink && !hasSteamStoreLink) {
+      continue;
+    }
+
     // Title
     const raw = (map.title ? r[map.title] : "")?.trim() || "";
     const title = extractTitle(raw);
@@ -142,3 +164,4 @@ export function rowsToEntities(rows: IncomingRow[], map: FieldMap) {
 
   return { identities, library };
 }
+

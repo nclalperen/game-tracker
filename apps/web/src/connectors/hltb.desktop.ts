@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+﻿import { invoke } from "@tauri-apps/api/core";
 
 export async function fetchHLTBMetaNative(title: string) {
   // Tauri command returns { main_median_hours: number|null, source: string }

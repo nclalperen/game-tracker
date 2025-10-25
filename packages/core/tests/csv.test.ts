@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+﻿import { describe, it, expect } from "vitest";
 import { parseCSV, toCSV } from "../src/csv";
 
 describe("csv roundtrip", () => {

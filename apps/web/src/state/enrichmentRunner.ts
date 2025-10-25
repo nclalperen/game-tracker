@@ -1,4 +1,4 @@
-import { useSyncExternalStore } from "react";
+﻿import { useSyncExternalStore } from "react";
 import {
   db,
   clearEnrichSession,
@@ -9,12 +9,12 @@ import {
   type EnrichRowSummary,
   type EnrichStatus,
 } from "@/db";
-import {
-  fetchHLTB,
-  fetchOpenCriticScore,
-  fetchSteamPrice,
-  isTauri,
-} from "@/desktop/bridge";
+import { fetchHLTB, fetchOpenCriticScore, fetchSteamPrice, isTauri } from "@/desktop/bridge";
+import { lookupLocalHLTB } from "@/data/localDatasets";
+import { ensureRawgDetail } from "@/data/rawgCache";
+import { loadMCIndex, mcKey, type MCEntry } from "@/data/metacriticIndex";
+import { normalizeTitleKey } from "@/utils/normalize";
+import type { Identity } from "@tracker/core";
 
 const INIT_MIN_MS = 600;
 
@@ -46,12 +46,15 @@ export type RunnerSnapshot = {
 
 type Listener = () => void;
 
+type EnrichRowStage = "vendor" | "fallback";
+
 type InternalRow = EnrichRowSnapshot & {
   attempts: {
     steam: number;
     hltb: number;
     oc: number;
   };
+  stage: EnrichRowStage;
 };
 
 class EnrichmentRunner {
@@ -80,6 +83,9 @@ class EnrichmentRunner {
   };
   private ocLRU = new Map<string, number>();
   private ocLRUMax = 200;
+  private mcIndexPromise: Promise<Record<string, MCEntry>> | null = null;
+  private maxConcurrentRows = 3;
+  private activeRowIds = new Set<string>();
   private snapshot: RunnerSnapshot = this.buildSnapshot();
 
   constructor() {
@@ -90,6 +96,36 @@ class EnrichmentRunner {
     if (this.pendingActiveTimer) {
       clearTimeout(this.pendingActiveTimer);
       this.pendingActiveTimer = null;
+    }
+  }
+
+  private async ensureMCIndex() {
+    if (!this.mcIndexPromise) {
+      this.mcIndexPromise = loadMCIndex();
+    }
+    return this.mcIndexPromise;
+  }
+
+  private async finalizeIfDone() {
+    if (
+      this.sessionId &&
+      !this.queue.some((row) => row.status === "pending" || row.status === "fetching" || row.status === "paused")
+    ) {
+      this.finished = true;
+      this.message = "Enrichment finished.";
+      this.lastUpdated = Date.now();
+      this.phase = "done";
+      this.initStartedAt = null;
+      this.clearPendingActiveTimer();
+      this.emit();
+      const sessionToClear = this.sessionId;
+      this.sessionId = null;
+      await clearEnrichSession();
+      if (sessionToClear) {
+        this.emit();
+      }
+    } else {
+      this.emit();
     }
   }
 
@@ -155,8 +191,11 @@ class EnrichmentRunner {
         ttb: null,
         ttbSource: undefined,
         ocScore: null,
+        mcScore: null,
         message: "Desktop-only enrichment",
         attempts: { steam: 0, hltb: 0, oc: 0 },
+        criticScoreSource: undefined,
+        stage: "vendor",
       }));
       this.recent = [];
       this.emit();
@@ -187,8 +226,11 @@ class EnrichmentRunner {
       ttb: null,
       ttbSource: undefined,
       ocScore: null,
+      mcScore: null,
       message: null,
       attempts: { steam: 0, hltb: 0, oc: 0 },
+      criticScoreSource: undefined,
+      stage: "vendor",
     }));
     this.recent = [];
     this.emit();
@@ -264,47 +306,67 @@ class EnrichmentRunner {
   }
 
   private async processLoop() {
+    const workers = new Set<Promise<void>>();
+
     while (this.sessionId) {
       if (this.paused) {
         await this.waitForResume();
         continue;
       }
 
-      const next =
-        this.queue.find((row) => row.id === this.currentRowId && row.status === "fetching") ??
-        this.queue.find((row) => row.status === "pending" || row.status === "paused");
+      while (!this.paused && workers.size < this.maxConcurrentRows) {
+        const next = this.takeNextRow();
+        if (!next) break;
 
-      if (!next) break;
+        this.currentRowId = next.id;
+        this.activeRowIds.add(next.id);
+        next.status = "fetching";
+        next.updatedAt = Date.now();
+        next.message = null;
+        this.message = `Fetching ${next.title}`;
+        this.requestActiveTransition();
+        this.emit();
 
-      this.currentRowId = next.id;
-      next.status = "fetching";
-      next.updatedAt = Date.now();
-      next.message = null;
-      this.message = `Fetching ${next.title}`;
-      this.requestActiveTransition();
-      this.emit();
+        const worker = this.runRow(next)
+          .then(async (outcome) => {
+            this.activeRowIds.delete(next.id);
+            if (outcome === "paused") {
+              return;
+            }
+            await this.finalizeIfDone();
+          })
+          .catch((err) => {
+            this.activeRowIds.delete(next.id);
+            console.error("runner worker failed", err);
+          })
+          .finally(() => {
+            workers.delete(worker);
+          });
 
-      const outcome = await this.runRow(next);
-      if (outcome === "paused") {
+        workers.add(worker);
+      }
+
+      if (this.paused) {
+        await this.waitForResume();
         continue;
+      }
+
+      if (!this.sessionId) break;
+
+      if (workers.size === 0) {
+        await this.waitForResume();
+        continue;
+      }
+
+      try {
+        await Promise.race(workers);
+      } catch {
+        // errors handled per worker
       }
     }
 
-    if (
-      this.sessionId &&
-      !this.queue.some((row) => row.status === "pending" || row.status === "fetching" || row.status === "paused")
-    ) {
-      this.finished = true;
-      this.message = "Enrichment finished.";
-      this.lastUpdated = Date.now();
-      this.phase = "done";
-      this.initStartedAt = null;
-      this.clearPendingActiveTimer();
-      this.emit();
-      this.sessionId = null;
-      await clearEnrichSession();
-      this.emit();
-    }
+    await Promise.allSettled(workers);
+    await this.finalizeIfDone();
   }
 
   private waitForResume() {
@@ -312,6 +374,14 @@ class EnrichmentRunner {
     return new Promise<void>((resolve) => {
       this.resumeResolvers.push(resolve);
     });
+  }
+
+  private takeNextRow(): InternalRow | undefined {
+    return this.queue.find(
+      (row) =>
+        !this.activeRowIds.has(row.id) &&
+        (row.status === "pending" || row.status === "paused"),
+    );
   }
 
   private async awaitBudget(service: "steam" | "hltb" | "oc") {
@@ -330,17 +400,60 @@ class EnrichmentRunner {
       return "paused";
     }
 
+    let identityPlatform: string | undefined;
+    let identityDoc: Identity | undefined;
     try {
       const identity = await db.identities.get(row.identityId);
       if (identity) {
         row.title = identity.title ?? row.title;
         row.appid = identity.appid ?? row.appid;
+        identityPlatform = identity.platform ?? undefined;
+        identityDoc = identity as Identity;
+        if (identity.ttbMedianMainH != null && row.ttb == null) {
+          row.ttb = identity.ttbMedianMainH;
+          row.ttbSource = identity.ttbSource;
+        }
+        if (identity.mcScore != null && row.mcScore == null) {
+          row.mcScore = identity.mcScore;
+        }
+        if (identity.ocScore != null && row.ocScore == null) {
+          row.ocScore = identity.ocScore;
+        }
+        if (identity.criticScoreSource && !row.criticScoreSource) {
+          row.criticScoreSource = identity.criticScoreSource;
+        }
       }
     } catch (_err) {
       // Dexie lookup errors are ignored; we rely on best-effort data.
     }
 
-    // Steam price
+    const stage: EnrichRowStage = row.stage ?? "vendor";
+    row.stage = stage;
+
+    if (stage === "vendor") {
+      const outcome = await this.runVendorStage(row, identityDoc, identityPlatform);
+      if (outcome === "fallback") {
+        this.enqueueFallback(row);
+        return "done";
+      }
+      if (outcome === "done") {
+        this.finalizeRow(row);
+      }
+      return outcome;
+    }
+
+    const outcome = await this.runFallbackStage(row, identityDoc);
+    if (outcome === "done") {
+      this.finalizeRow(row);
+    }
+    return outcome;
+  }
+
+  private async runVendorStage(
+    row: InternalRow,
+    identityDoc: Identity | undefined,
+    identityPlatform: string | undefined,
+  ): Promise<"done" | "paused" | "fallback"> {
     if (row.appid) {
       const steam = await this.tryWithRetries("steam", row, async () => {
         await this.awaitBudget("steam");
@@ -379,37 +492,78 @@ class EnrichmentRunner {
       }
     }
 
-    // HowLongToBeat
-    const hltb = await this.tryWithRetries("hltb", row, async () => {
-      await this.awaitBudget("hltb");
-      return fetchHLTB(row.title);
-    });
-    if (hltb.kind === "paused") {
+    let ttbResolved = row.ttb != null && !Number.isNaN(row.ttb);
+    if (!ttbResolved) {
+      try {
+        const hours = await lookupLocalHLTB(row.title, identityPlatform);
+        if (hours != null) {
+          row.ttb = hours;
+          row.ttbSource = "hltb-local";
+          try {
+            await db.library.update(row.id, { ttbMedianMainH: hours } as any);
+            await db.identities.update(row.identityId, {
+              ttbMedianMainH: hours,
+              ttbSource: "hltb-local",
+            } as any);
+          } catch (_err) {
+            // Ignore Dexie write errors.
+          }
+          ttbResolved = true;
+        }
+      } catch (_err) {
+        console.error("HowLongToBeat lookup failed", _err);
+      }
+    }
+    if (!ttbResolved && this.paused) {
       row.status = "paused";
       row.updatedAt = Date.now();
       this.emit();
       return "paused";
     }
-    if (hltb.kind === "ok") {
-      const meta = hltb.value;
-      if (meta.mainMedianHours != null) {
-        row.ttb = meta.mainMedianHours;
-        row.ttbSource = meta.source;
-        try {
-          await db.library.update(row.id, { ttbMedianMainH: row.ttb } as any);
-          await db.identities.update(row.identityId, {
-            ttbMedianMainH: row.ttb,
-            ttbSource: row.ttbSource,
-          } as any);
-        } catch (_err) {
-          // Ignore Dexie write errors.
-        }
-      } else {
-        appendMessage(row, "HowLongToBeat: not found.");
-      }
-    } else if (hltb.kind === "error") {
-      appendMessage(row, hltb.message);
+
+    let criticResolved = row.mcScore != null && !Number.isNaN(row.mcScore);
+    if (criticResolved) {
+      row.criticScoreSource = "metacritic";
+      row.ocScore = null;
     }
+
+    if (!criticResolved && row.title) {
+      try {
+        const mcIndex = await this.ensureMCIndex();
+        const key = mcKey(row.title, identityPlatform, undefined);
+        const mc = mcIndex[key];
+        if (mc?.score != null) {
+          row.mcScore = Math.round(mc.score);
+          row.criticScoreSource = "metacritic";
+          row.ocScore = null;
+          criticResolved = true;
+          const updates: Partial<Identity> = {
+            mcScore: row.mcScore,
+            criticScoreSource: "metacritic",
+            ocScore: null,
+          };
+          if ((!identityDoc?.platform || identityDoc.platform === "unknown") && mc.platform) {
+            const mapped = canonicalToIdentityPlatform(mc.platform);
+            if (mapped) {
+              updates.platform = mapped as any;
+              identityPlatform = mapped;
+            }
+          }
+          if ((!identityDoc?.mcGenres || identityDoc.mcGenres.length === 0) && mc.genres) {
+            updates.mcGenres = mc.genres.split(/,s*/).slice(0, 3);
+          }
+          try {
+            await db.identities.update(row.identityId, updates as any);
+          } catch (_err) {
+            // Non-fatal write failure.
+          }
+          appendMessage(row, "Metacritic (vendor) score cached.");
+        }
+      } catch (err) {
+        console.warn("Metacritic vendor lookup failed", err);
+      }
+    }
+
     if (this.paused) {
       row.status = "paused";
       row.updatedAt = Date.now();
@@ -417,45 +571,183 @@ class EnrichmentRunner {
       return "paused";
     }
 
-    // OpenCritic
-    const oc = await this.tryWithRetries("oc", row, async () => {
-      // Skip request if identity already has a score or cached in-session
+    if (!ttbResolved || !criticResolved) {
+      return "fallback";
+    }
+
+    return "done";
+  }
+
+  private async runFallbackStage(
+    row: InternalRow,
+    identityDoc: Identity | undefined,
+  ): Promise<"done" | "paused"> {
+    let ttbResolved = row.ttb != null && !Number.isNaN(row.ttb);
+
+    if (!ttbResolved && isTauri) {
+      const hltb = await this.tryWithRetries("hltb", row, async () => {
+        await this.awaitBudget("hltb");
+        return fetchHLTB(row.title);
+      });
+      if (hltb.kind === "paused") {
+        row.status = "paused";
+        row.updatedAt = Date.now();
+        this.emit();
+        return "paused";
+      }
+      if (hltb.kind === "ok") {
+        const result = hltb.value;
+        const hours = result?.mainMedianHours ?? null;
+        if (hours != null) {
+          row.ttb = hours;
+          row.ttbSource = result.source;
+          try {
+            await db.library.update(row.id, { ttbMedianMainH: hours } as any);
+            await db.identities.update(row.identityId, {
+              ttbMedianMainH: hours,
+              ttbSource: result.source,
+            } as any);
+          } catch (_err) {
+            // Ignore Dexie write errors.
+          }
+          ttbResolved = true;
+        } else {
+          appendMessage(row, "HowLongToBeat: not found after retries.");
+        }
+      } else if (hltb.kind === "error") {
+        appendMessage(row, hltb.message);
+      }
+    }
+
+    if (!ttbResolved) {
       try {
-        const ident = await db.identities.get(row.identityId);
-        if (ident?.ocScore != null) return ident.ocScore as any;
-      } catch {}
-      const norm = normalizeTitleKey(row.title);
-      if (this.ocLRU.has(norm)) return this.ocLRU.get(norm)! as any;
-      await this.awaitBudget("oc");
-      return fetchOpenCriticScore(row.title);
-    });
-    if (oc.kind === "paused") {
+        const rawg = await ensureRawgDetail(row.title);
+        if (rawg?.playtimeHours != null && rawg.playtimeHours > 0) {
+          row.ttb = rawg.playtimeHours;
+          row.ttbSource = "rawg";
+          try {
+            await db.library.update(row.id, { ttbMedianMainH: rawg.playtimeHours } as any);
+            await db.identities.update(row.identityId, {
+              ttbMedianMainH: rawg.playtimeHours,
+              ttbSource: "rawg",
+            } as any);
+          } catch (_err) {
+            // Ignore Dexie write errors.
+          }
+          appendMessage(row, "HowLongToBeat: estimated via RAWG playtime.");
+          ttbResolved = true;
+        }
+      } catch (err) {
+        console.warn("RAWG playtime lookup failed", err);
+      }
+    }
+
+    if (!ttbResolved && !isTauri) {
+      appendMessage(row, "HowLongToBeat: not available (desktop-only).");
+    }
+
+    if (this.paused) {
       row.status = "paused";
       row.updatedAt = Date.now();
       this.emit();
       return "paused";
     }
-    if (oc.kind === "ok") {
-      if (oc.value != null) {
-        row.ocScore = Math.round(oc.value);
-        try {
-          await db.identities.update(row.identityId, { ocScore: row.ocScore } as any);
-        } catch (_err) {
-          // Ignore Dexie write errors.
-        }
-        const norm = normalizeTitleKey(row.title);
-        this.ocLRU.set(norm, row.ocScore);
-        if (this.ocLRU.size > this.ocLRUMax) {
-          const first = this.ocLRU.keys().next().value as string | undefined;
-          if (first) this.ocLRU.delete(first);
-        }
-      } else {
-        appendMessage(row, "OpenCritic: not found.");
+
+    let criticResolved = row.mcScore != null && !Number.isNaN(row.mcScore);
+    if (criticResolved) {
+      row.criticScoreSource = "metacritic";
+      row.ocScore = null;
+    } else {
+      if (row.ocScore == null && identityDoc?.ocScore != null) {
+        row.ocScore = identityDoc.ocScore;
       }
-    } else if (oc.kind === "error") {
-      appendMessage(row, oc.message);
+      if (!row.criticScoreSource && identityDoc?.criticScoreSource) {
+        row.criticScoreSource = identityDoc.criticScoreSource;
+      }
+      criticResolved = row.ocScore != null && !Number.isNaN(row.ocScore);
     }
 
+    if (!criticResolved && row.title) {
+      try {
+        const rawg = await ensureRawgDetail(row.title);
+        const rawgScore = rawg?.aggregatedScore ?? rawg?.metacriticScore ?? null;
+        if (rawgScore != null) {
+          row.ocScore = Math.round(rawgScore);
+          row.criticScoreSource = "rawg";
+          criticResolved = true;
+          try {
+            await db.identities.update(row.identityId, {
+              ocScore: row.ocScore,
+              criticScoreSource: "rawg",
+            } as any);
+          } catch (_err) {
+            // Cache write failure is non-fatal.
+          }
+          appendMessage(row, "Critic score from RAWG fallback.");
+        }
+      } catch (err) {
+        console.warn("RAWG critic score lookup failed", err);
+      }
+    }
+
+    if (!criticResolved && isTauri) {
+      const oc = await this.tryWithRetries("oc", row, async () => {
+        try {
+          const ident = await db.identities.get(row.identityId);
+          if (ident?.ocScore != null && ident?.criticScoreSource === "opencritic") {
+            return ident.ocScore as any;
+          }
+        } catch (_err) {
+          // ignore
+        }
+        const norm = normalizeTitleKey(row.title);
+        if (this.ocLRU.has(norm)) return this.ocLRU.get(norm)! as any;
+        await this.awaitBudget("oc");
+        return fetchOpenCriticScore(row.title);
+      });
+      if (oc.kind === "paused") {
+        row.status = "paused";
+        row.updatedAt = Date.now();
+        this.emit();
+        return "paused";
+      }
+      if (oc.kind === "ok") {
+        if (oc.value != null) {
+          row.ocScore = Math.round(oc.value);
+          row.criticScoreSource = "opencritic";
+          criticResolved = true;
+          try {
+            await db.identities.update(row.identityId, {
+              ocScore: row.ocScore,
+              criticScoreSource: "opencritic",
+            } as any);
+          } catch (_err) {
+            // Ignore Dexie write errors.
+          }
+          const norm = normalizeTitleKey(row.title);
+          this.ocLRU.set(norm, row.ocScore);
+          if (this.ocLRU.size > this.ocLRUMax) {
+            const first = this.ocLRU.keys().next().value as string | undefined;
+            if (first) this.ocLRU.delete(first);
+          }
+        } else {
+          appendMessage(row, "OpenCritic: not found.");
+        }
+      } else if (oc.kind === "error") {
+        appendMessage(row, oc.message);
+      }
+    } else if (!criticResolved && !isTauri) {
+      appendMessage(row, "Critic score fallback (OpenCritic) requires the desktop build.");
+    }
+
+    if (!criticResolved) {
+      appendMessage(row, "Critic score not resolved after fallbacks.");
+    }
+
+    return "done";
+  }
+
+  private finalizeRow(row: InternalRow) {
     row.status = "done";
     row.updatedAt = Date.now();
     this.lastUpdated = row.updatedAt;
@@ -468,16 +760,31 @@ class EnrichmentRunner {
         price: row.price ?? undefined,
         currencyCode: row.currencyCode ?? undefined,
         ttb: row.ttb ?? undefined,
+        ttbSource: row.ttbSource,
         ocScore: row.ocScore ?? undefined,
+        mcScore: row.mcScore ?? undefined,
+        criticScoreSource: row.criticScoreSource,
       },
       ...this.recent,
     ].slice(0, 10);
 
     this.requestActiveTransition();
     this.emit();
-    return "done";
   }
 
+  private enqueueFallback(row: InternalRow) {
+    row.stage = "fallback";
+    row.status = "pending";
+    row.updatedAt = Date.now();
+    appendMessage(row, "Queued for fallback sources.");
+    const idx = this.queue.indexOf(row);
+    if (idx >= 0) {
+      this.queue.splice(idx, 1);
+      this.queue.push(row);
+    }
+    this.requestActiveTransition();
+    this.emit();
+  }
   private async hydrate() {
     const stored = await getEnrichSession();
     if (!stored) {
@@ -495,6 +802,7 @@ class EnrichmentRunner {
       ...row,
       status: row.status === "fetching" ? "paused" : row.status,
       attempts: { steam: 0, hltb: 0, oc: 0 },
+      stage: row.stage === "fallback" ? "fallback" : "vendor",
     }));
     this.recent = stored.recent ?? [];
     this.message = "Ready to resume enrichment.";
@@ -533,13 +841,13 @@ class EnrichmentRunner {
         startedAt: this.startedAt ?? Date.now(),
         lastUpdated: this.lastUpdated ?? Date.now(),
         paused: this.paused,
-      totalRows: this.queue.length,
-      completedCount: this.queue.filter((row) => row.status === "done").length,
-      region: this.region,
-      queue: this.queue.map((row) => ({ ...row })),
-      recent: [...this.recent],
-      phase: this.phase,
-    };
+        totalRows: this.queue.length,
+        completedCount: this.queue.filter((row) => row.status === "done").length,
+        region: this.region,
+        queue: this.queue.map((row) => ({ ...row })),
+        recent: [...this.recent],
+        phase: this.phase,
+      };
       void setEnrichSession(payload);
     } else {
       void clearEnrichSession();
@@ -603,6 +911,25 @@ function appendMessage(row: InternalRow, text: string) {
   row.message = row.message ? `${row.message}; ${text}` : text;
 }
 
+function canonicalToIdentityPlatform(canonical: string): string | undefined {
+  switch (canonical) {
+    case "pc":
+    case "mac":
+    case "linux":
+      return "PC";
+    case "ps5":
+    case "ps4":
+      return "PlayStation";
+    case "xsx":
+    case "xboxone":
+      return "Xbox";
+    case "switch":
+      return "Switch";
+    default:
+      return undefined;
+  }
+}
+
 function makeSessionId() {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return crypto.randomUUID();
@@ -616,15 +943,6 @@ function sleep(ms: number) {
   });
 }
 
-function normalizeTitleKey(s: string) {
-  return s
-    .toLowerCase()
-    .replace(/[™®©]/g, "")
-    .replace(/[:;—–,.]/g, " ")
-    .replace(/[\[\]()"']/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
 
 const runner = new EnrichmentRunner();
 

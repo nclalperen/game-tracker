@@ -1,7 +1,8 @@
-import { useState, useEffect } from "react";
+﻿import { useState, useEffect } from "react";
 import { clearAllData } from "@/db";
+import { lookupLocalHLTB } from "@/data/localDatasets";
 import { db } from "@/db";
-import { fetchHLTB, fetchSteamPrice, fetchOpenCriticScore, isTauri } from "@/desktop/bridge";
+import { fetchSteamPrice, fetchOpenCriticScore, isTauri } from "@/desktop/bridge";
 
 /**
  * Settings page for Game Tracker.  This component allows users to toggle
@@ -55,36 +56,31 @@ export default function SettingsPage() {
   const [ocOn, setOcOn] = useToggle("oc_enabled", "0");
 
   /**
-   * Bulk fetch: iterate all library entries and update missing HLTB times.  Uses
-   * the desktop bridge to fetch data.  Only available when running under
-   * Tauri; otherwise shows an alert.  This function respects user
-   * preferences, but does not prompt per item; it will attempt to fetch all
-   * titles regardless of existing values.
+   * Bulk fetch: iterate all library entries and update missing HLTB times using
+   * the local dataset. Titles not present in the dataset are skipped.
    */
   async function fetchAllHLTB() {
-    if (!isTauri) {
-      alert("Fetching HLTB times is only supported on the desktop build.");
-      return;
-    }
     const libs = await db.library.toArray();
+    let updated = 0;
     for (const row of libs) {
       try {
         const identity = await db.identities.get(row.identityId);
         if (!identity || !identity.title) continue;
-        const { mainMedianHours, source } = await fetchHLTB(identity.title);
-        if (mainMedianHours != null) {
-          await db.library.update(row.id, {
-            ttbMedianMainH: mainMedianHours,
-          } as any);
-          await db.identities.update(row.identityId, {
-            ttbSource: source === "hltb-cache" ? "hltb-cache" : "hltb",
-          } as any);
-        }
-      } catch (e: any) {
-        console.error("HLTB bulk fetch failed for", row.id, e);
+        const hours = await lookupLocalHLTB(identity.title, identity.platform ?? undefined);
+        if (hours == null) continue;
+        await db.library.update(row.id, {
+          ttbMedianMainH: hours,
+        } as any);
+        await db.identities.update(row.identityId, {
+          ttbSource: "hltb-local",
+          ttbMedianMainH: hours,
+        } as any);
+        updated++;
+      } catch (e) {
+        console.error("HLTB local fetch failed for", row?.identityId, e);
       }
     }
-    alert("HLTB fetch complete.");
+    alert(`HLTB local update complete (${updated} updated).`);
   }
 
   /**
@@ -198,12 +194,15 @@ export default function SettingsPage() {
           }
         })()}>
           <input type="checkbox" checked={hltbOn} disabled={!(typeof window !== "undefined" && (window as any).__TAURI__)} onChange={(e) => setHltbOn(e.target.checked)} />
-          <span>HowLongToBeat (desktop)</span>
+          <span>HowLongToBeat (local dataset)</span>
         </label>
         <label className="flex items-center gap-3">
           <input type="checkbox" checked={ocOn} onChange={(e) => setOcOn(e.target.checked)} />
           <span>OpenCritic (requires API)</span>
         </label>
+        <p className="text-xs text-zinc-500">
+          Data sources: HLTB (local vendor + desktop live), Scores: OpenCritic -&gt; Metacritic vendor, Metadata/media: RAWG (cached).
+        </p>
       </section>
 
       {/* Card layout fixed to "Large" size.  The card width is set globally to 340px via CSS. */}
@@ -296,3 +295,10 @@ export default function SettingsPage() {
     </div>
   );
 }
+
+
+
+
+
+
+

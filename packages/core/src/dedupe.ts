@@ -1,4 +1,4 @@
-import type { Identity } from "./types";
+﻿import type { Identity } from "./types";
 
 /** Simple dedupe by (normalized title, normalized platform) keeping the first. */
 export function dedupeIdentities(list: Identity[]): Identity[] {

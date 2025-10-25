@@ -1,4 +1,4 @@
-export * from './types';
+﻿export * from './types';
 export * from './flags';
 export * from './uid';
 export * from './csv';
@@ -6,5 +6,6 @@ export * from './normalize';
 export * from './suggest';
 export * from './steamHtml';
 export * from './importers';
-export * from "./normalize";
 export * from "./dedupe";
+export * from "./data/normalizeTitle";
+export * from "./data/platforms";

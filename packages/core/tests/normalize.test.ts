@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+﻿import { describe, it, expect } from "vitest";
 import { pricePerHour } from "../src/normalize";
 
 describe("pricePerHour", () => {

@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+﻿import { invoke } from "@tauri-apps/api/core";
 
 export const isTauri =
   typeof window !== "undefined" && Boolean((window as any).__TAURI_INTERNALS__);

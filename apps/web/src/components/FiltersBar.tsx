@@ -1,8 +1,8 @@
-import { useMemo } from "react";
+﻿import { useMemo } from "react";
 
 export type Filters = {
   duration?: "short" | "medium" | "long" | "any";
-  value?: "good" | "ok" | "poor" | "any";     // ₺/h
+  value?: "good" | "ok" | "poor" | "any";     // â‚º/h
   score?: "80+" | "70+" | "any";
   platform?: string | "any";
   account?: string | "any";
@@ -42,15 +42,15 @@ export default function FiltersBar({
 
   const durationOpts = useMemo<Opt[]>(() => [
     {label:"Any", value:"any"},
-    {label:"≤10h", value:"short"},
-    {label:"10–30h", value:"medium"},
-    {label:"≥30h", value:"long"},
+    {label:"â‰¤10h", value:"short"},
+    {label:"10â€“30h", value:"medium"},
+    {label:"â‰¥30h", value:"long"},
   ], []);
   const valueOpts: Opt[] = [
     {label:"Any", value:"any"},
-    {label:"₺/h ≤ 10", value:"good"},
-    {label:"₺/h ≤ 20", value:"ok"},
-    {label:"₺/h > 20", value:"poor"},
+    {label:"â‚º/h â‰¤ 10", value:"good"},
+    {label:"â‚º/h â‰¤ 20", value:"ok"},
+    {label:"â‚º/h > 20", value:"poor"},
   ];
   const scoreOpts: Opt[] = [
     {label:"Any", value:"any"},

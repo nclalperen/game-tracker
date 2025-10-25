@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+﻿import { useEffect, useMemo, useState } from "react";
 import { db } from "@/db";
 import {
   computeSuggestions,
@@ -104,7 +104,7 @@ export default function SuggestionsPage() {
             onChange={(v) => setWeights({ ...weights, backlogBoost: v })}
           />
           <WeightSlider
-            label="Value (₺/h)"
+            label="Value (â‚º/h)"
             value={weights.valueWeight}
             onChange={(v) => setWeights({ ...weights, valueWeight: v })}
           />
@@ -138,7 +138,7 @@ export default function SuggestionsPage() {
                   <div className="font-medium">
                     {ident?.title || s.item.identityId}
                   </div>
-                  <span className="badge">{ident?.platform ?? "—"}</span>
+                  <span className="badge">{ident?.platform ?? "â€”"}</span>
                 </div>
                 <div className="mt-2 flex flex-wrap gap-1">
                   {s.reason.map((r: string) => (
@@ -155,7 +155,7 @@ export default function SuggestionsPage() {
           })}
           {playNext.length === 0 && (
             <div className="text-sm text-zinc-500">
-              No suggestions yet — add some Backlog items.
+              No suggestions yet â€” add some Backlog items.
             </div>
           )}
         </div>
@@ -173,7 +173,7 @@ export default function SuggestionsPage() {
                   <div className="font-medium">
                     {ident?.title || s.item.identityId}
                   </div>
-                  <span className="badge">{ident?.platform ?? "—"}</span>
+                  <span className="badge">{ident?.platform ?? "â€”"}</span>
                 </div>
                 <div className="mt-2 flex flex-wrap gap-1">
                   {s.reason.map((r: string) => (
@@ -183,7 +183,9 @@ export default function SuggestionsPage() {
                   ))}
                 </div>
                 <div className="mt-2 text-xs text-zinc-500">
-                  score {Math.round(s.score)} · deals: (coming soon)
+                  score {Math.round(s.score)}
+                  {" \u00b7 "}
+                  deals: (coming soon)
                 </div>
               </article>
             );
@@ -230,3 +232,4 @@ function WeightSlider({
     </label>
   );
 }
+

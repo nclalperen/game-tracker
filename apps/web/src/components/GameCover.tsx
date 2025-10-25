@@ -1,5 +1,6 @@
-import { useMemo, useState } from "react";
+﻿import { useEffect, useMemo, useState } from "react";
 import type { Identity } from "@tracker/core";
+import { ensureRawgDetail } from "@/data/rawgCache";
 
 type Size = "xs" | "sm" | "md" | "lg";
 
@@ -35,10 +36,39 @@ export default function GameCover({
       lg: "w-24",
     }[size] || "w-16";
 
+  const [rawgImage, setRawgImage] = useState<string | null>(null);
+  const appid = (identity as any)?.appid as number | undefined;
+  const igdbCoverId = (identity as any)?.igdbCoverId as string | undefined;
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function hydrateRawgCover() {
+      const title = identity?.title;
+      const shouldPrefetch = !appid && !igdbCoverId;
+      if (!title || !shouldPrefetch) return;
+      try {
+        const detail = await ensureRawgDetail(title);
+        if (!cancelled && detail?.backgroundImage) {
+          setRawgImage(detail.backgroundImage);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          console.warn("RAWG cover lookup failed", err);
+        }
+      }
+    }
+
+    void hydrateRawgCover();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [identity?.title, appid, igdbCoverId]);
+
+  // Cover precedence: Steam capsule -> IGDB cover -> RAWG artwork fallback.
   const candidates = useMemo(() => {
     const urls: string[] = [];
-    const appid = (identity as any)?.appid as number | undefined;
-    const igdbCoverId = (identity as any)?.igdbCoverId as string | undefined;
 
     if (appid) {
       // Prefer Steam portrait library art (2:3),
@@ -55,8 +85,11 @@ export default function GameCover({
         `https://images.igdb.com/igdb/image/upload/t_cover_big/${igdbCoverId}.jpg`
       );
     }
+    if (rawgImage) {
+      urls.push(rawgImage);
+    }
     return urls;
-  }, [identity]);
+  }, [appid, igdbCoverId, rawgImage]);
 
   const [idx, setIdx] = useState(0);
 
@@ -86,3 +119,8 @@ export default function GameCover({
     </div>
   );
 }
+
+
+
+
+

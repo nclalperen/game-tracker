@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+﻿import { useCallback, useEffect, useMemo, useState } from "react";
 import Modal from "./Modal";
 import { db, type EnrichStatus } from "@/db";
 import {
@@ -193,7 +193,7 @@ export default function ImportWizard({ open, onClose, onImported }: ImportWizard
             className={idx === stepIndex ? "font-semibold text-zinc-900" : "opacity-70"}
           >
             {STEP_LABELS[s]}
-            {idx < STEPS.length - 1 ? " ·" : ""}
+            {idx < STEPS.length - 1 ? " \u00b7" : ""}
           </span>
         ))}
       </div>
@@ -441,7 +441,7 @@ function ReviewStep({
           Back
         </button>
         <button type="button" className="btn" onClick={onImport} disabled={importing}>
-          {importing ? "Importing…" : "Import rows"}
+          {importing ? "Importingâ€¦" : "Import rows"}
         </button>
       </div>
     </div>
@@ -593,11 +593,40 @@ function EnrichStep({
               >
                 <span className="truncate">{item.title}</span>
                 <span className="text-xs text-zinc-500">
-                  {item.currencyCode && item.price != null
-                    ? `${item.currencyCode} ${item.price}`
-                    : ""}
-                  {item.ttb != null ? ` · ${item.ttb}h` : ""}
-                  {item.ocScore != null ? ` · OC ${item.ocScore}` : ""}
+                  {(() => {
+                    const parts: string[] = [];
+                    if (item.currencyCode && item.price != null) {
+                      parts.push(`${item.currencyCode} ${item.price}`);
+                    }
+                    if (item.ttb != null) {
+                      const ttbSourceLabel = (() => {
+                        switch (item.ttbSource) {
+                          case "hltb":
+                          case "hltb-cache":
+                          case "hltb-local":
+                          case "html":
+                            return "HLTB";
+                          case "igdb":
+                            return "IGDB";
+                          case "rawg":
+                            return "RAWG";
+                          case "manual":
+                            return "Manual";
+                          default:
+                            return undefined;
+                        }
+                      })();
+                      parts.push(`${ttbSourceLabel ? `TTB (${ttbSourceLabel})` : "TTB"} ${item.ttb}h`);
+                    }
+                    if (item.mcScore != null) {
+                      parts.push(`MC ${item.mcScore}`);
+                    } else if (item.ocScore != null) {
+                      const scoreLabel =
+                        item.criticScoreSource === "rawg" ? "RAWG" : "OC";
+                      parts.push(`${scoreLabel} ${item.ocScore}`);
+                    }
+                    return parts.length ? parts.join(" \u00b7 ") : "\u2014";
+                  })()}
                 </span>
               </li>
             ))}
@@ -692,3 +721,4 @@ function guessFieldMap(rows: IncomingRow[]): FieldMap {
     services: find(/service/, /subscription/, /tag/),
   };
 }
+

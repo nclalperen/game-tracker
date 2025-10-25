@@ -1,4 +1,4 @@
-// // apps/web/src/db.ts
+﻿// // apps/web/src/db.ts
 // import Dexie, { Table } from "dexie";
 // import type {
 //   Identity,
@@ -74,7 +74,7 @@
 // export const db = new GTDb();
 
 // /**
-//  * Utility: clear all app data (used by “Clear Profile” button).
+//  * Utility: clear all app data (used by â€œClear Profileâ€ button).
 //  * Wraps in a transaction for safety.
 //  */
 // export async function clearAllData() {
