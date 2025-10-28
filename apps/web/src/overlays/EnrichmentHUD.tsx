@@ -1,4 +1,4 @@
-﻿import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useEnrichmentRunner } from "@/state/enrichmentRunner";
 
@@ -7,9 +7,11 @@ function InitLine() {
 }
 
 export default function EnrichmentHUD() {
-  const { snapshot, pause, resume, cancel } = useEnrichmentRunner();
+  const { snapshot, pause, resume, halt } = useEnrichmentRunner();
   const [container] = useState(() => document.createElement("div"));
   const [showCompleteToast, setShowCompleteToast] = useState(false);
+  const [visible, setVisible] = useState(true);
+  const prevSessionIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     container.className = "gt-hud-root";
@@ -20,6 +22,18 @@ export default function EnrichmentHUD() {
   }, [container]);
 
   useEffect(() => {
+    if (typeof window === "undefined") return;
+    const show = () => setVisible(true);
+    const hide = () => setVisible(false);
+    window.addEventListener("gt:show-enrichment", show);
+    window.addEventListener("gt:hide-enrichment", hide);
+    return () => {
+      window.removeEventListener("gt:show-enrichment", show);
+      window.removeEventListener("gt:hide-enrichment", hide);
+    };
+  }, []);
+
+  useEffect(() => {
     if (!snapshot.sessionId && snapshot.finished) {
       setShowCompleteToast(true);
       const timer = window.setTimeout(() => setShowCompleteToast(false), 4000);
@@ -28,10 +42,30 @@ export default function EnrichmentHUD() {
     if (snapshot.sessionId) {
       setShowCompleteToast(false);
     }
-    return;
   }, [snapshot.sessionId, snapshot.finished]);
 
-  if (!snapshot.sessionId && !showCompleteToast) {
+  useEffect(() => {
+    const current = snapshot.sessionId ?? null;
+    const prev = prevSessionIdRef.current;
+    if (current && current !== prev) {
+      setVisible(!snapshot.halted);
+    }
+    prevSessionIdRef.current = current;
+  }, [snapshot.sessionId, snapshot.halted]);
+
+  useEffect(() => {
+    if (snapshot.halted) {
+      setVisible(false);
+    }
+  }, [snapshot.halted]);
+
+  const hasSession = Boolean(snapshot.sessionId);
+
+  if (!hasSession && !showCompleteToast) {
+    return null;
+  }
+
+  if (hasSession && !visible) {
     return null;
   }
 
@@ -39,14 +73,19 @@ export default function EnrichmentHUD() {
   const completed = snapshot.completedCount || 0;
   const pct = total > 0 ? Math.min(100, Math.max(6, (completed / total) * 100)) : 0;
   const isPaused = snapshot.paused;
+  const isHalted = snapshot.halted;
   const latest = snapshot.recent[0];
   const title = snapshot.sessionId
     ? isPaused
-      ? "Enrichment paused"
+      ? isHalted
+        ? "Enrichment halted"
+        : "Enrichment paused"
       : "Enriching library"
     : "Enrichment complete";
   const subtitle = snapshot.sessionId
-    ? `${completed} / ${total} enriched`
+    ? isHalted
+      ? `Halted - ${completed} / ${total} enriched`
+      : `${completed} / ${total} enriched`
     : "Metadata enrichment finished";
 
   const line =
@@ -78,7 +117,7 @@ export default function EnrichmentHUD() {
 
   return createPortal(
     <>
-      {line}
+      {hasSession ? line : null}
 
       <div
         className="gt-hud-card"
@@ -102,16 +141,23 @@ export default function EnrichmentHUD() {
               <button
                 type="button"
                 className="gt-hud-card__btn"
-                onClick={() => cancel()}
-                title="Cancel enrichment"
+                onClick={() => {
+                  halt();
+                  if (typeof window !== "undefined") {
+                    window.dispatchEvent(new CustomEvent("gt:hide-enrichment"));
+                  }
+                }}
+                title="Halt enrichment (resume later from Settings)"
               >
-                Cancel
+                Halt
               </button>
               <button
                 type="button"
                 className="gt-hud-card__btn"
                 onClick={() => {
-                  window.dispatchEvent(new CustomEvent("gt:show-enrichment"));
+                  if (typeof window !== "undefined") {
+                    window.dispatchEvent(new CustomEvent("gt:show-enrichment"));
+                  }
                 }}
                 title="Show enrichment details"
               >
@@ -138,4 +184,3 @@ export default function EnrichmentHUD() {
     container,
   );
 }
-

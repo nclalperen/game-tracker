@@ -11,6 +11,10 @@ import { useEnrichmentRunner } from "@/state/enrichmentRunner";
 import { useVendorFlag, setVendorFlag, type VendorKey } from "@/state/vendorFlags";
 import { resetMCIndexCache } from "@/data/metacriticIndex";
 import { clearRawgApiCache } from "@/apis/rawg";
+import { allyVersion, allyGetDataDir, allyEmbed, allyStartRag, allyChat, allyWriteExport } from "@/desktop/allyBridge";
+import { localChat, localEmbed, localDetect, type LocalDetect } from "@/desktop/localLlmBridge";
+import { exportAll } from "@/ally/export";
+import { getOrCreateSession, resetSession } from "@/ally/session";
 import { invoke } from "@tauri-apps/api/core";
 
 const STEAM_REGION_OPTIONS = [
@@ -37,6 +41,15 @@ const STEAM_LANGUAGE_OPTIONS = [
   { value: "zh-cn", label: "Chinese (Simplified)" },
 ];
 
+const ALLY_LABEL = "my_library" as const;
+type AIProvider = "local" | "ally";
+
+type StepState = {
+  status: "idle" | "pending" | "success" | "error";
+  message?: string;
+  error?: string;
+};
+
 /**
  * Settings page for Game Tracker.  This component allows users to toggle
  * integrations, adjust card layout, and choose the Steam region for price
@@ -62,17 +75,41 @@ export default function SettingsPage() {
   const [savedSteamId, setSavedSteamId] = useState<string | null>(null);
   const [steamRegion, setSteamRegion] = useState("us");
   const [steamLanguage, setSteamLanguage] = useState("en");
-  const [steamResolveState, setSteamResolveState] = useState<{ status: "idle" | "pending" | "success" | "error"; message?: string }>(() => ({ status: "idle" }));
-  const [steamTestState, setSteamTestState] = useState<{ status: "idle" | "pending" | "success" | "error"; message?: string }>(() => ({ status: "idle" }));
+  const [steamResolveState, setSteamResolveState] = useState<StepState>(() => ({ status: "idle" }));
+  const [steamTestState, setSteamTestState] = useState<StepState>(() => ({ status: "idle" }));
+  const [allyState, setAllyState] = useState<StepState>(() => ({ status: "idle" }));
+  const [allyDataDir, setAllyDataDir] = useState<string | null>(null);
+  const [allyExportState, setAllyExportState] = useState<StepState>(() => ({ status: "idle" }));
+  const [allyExportResults, setAllyExportResults] = useState<Array<{ file: string; bytes: number }>>([]);
+  const [lastAllyExportISO, setLastAllyExportISO] = useState<string | null>(null);
+  const [aiProvider, setAiProvider] = useState<AIProvider>("local");
+  const [allyEmbedState, setAllyEmbedState] = useState<StepState>(() => ({ status: "idle" }));
+  const [allyStartState, setAllyStartState] = useState<StepState>(() => ({ status: "idle" }));
+  const [allyEmbedOutput, setAllyEmbedOutput] = useState<string | null>(null);
+  const [allyStartOutput, setAllyStartOutput] = useState<string | null>(null);
+  const [lastAllyEmbedISO, setLastAllyEmbedISO] = useState<string | null>(null);
+  const [lastAllyStartISO, setLastAllyStartISO] = useState<string | null>(null);
+  const [bootstrapRunning, setBootstrapRunning] = useState(false);
+  const [chatSession, setChatSession] = useState<string | null>(null);
+  const [chatInput, setChatInput] = useState("");
+  const [chatState, setChatState] = useState<StepState>(() => ({ status: "idle" }));
+  const [chatHistory, setChatHistory] = useState<Array<{ role: "user" | "ally"; content: string; isJson?: boolean }>>([]);
+  const [chatResponse, setChatResponse] = useState<{ content: string; isJson: boolean } | null>(null);
+  const [localInfo, setLocalInfo] = useState<LocalDetect | null>(null);
+  const [localChatState, setLocalChatState] = useState<StepState>(() => ({ status: "idle" }));
+  const [localChatOutput, setLocalChatOutput] = useState<string | null>(null);
+  const [localEmbedState, setLocalEmbedState] = useState<StepState>(() => ({ status: "idle" }));
+  const [localEmbedSummary, setLocalEmbedSummary] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const [storedId, storedRegion, storedLang] = await Promise.all([
+        const [storedId, storedRegion, storedLang, storedProvider] = await Promise.all([
           getSetting<string>("steam.myId"),
           getSetting<string>("steam.region"),
           getSetting<string>("steam.lang"),
+          getSetting<AIProvider>("ai.provider"),
         ]);
         if (cancelled) return;
         if (storedId) {
@@ -85,9 +122,43 @@ export default function SettingsPage() {
         const langPref = (storedLang || localStorage.getItem("steam_lang") || "en").toLowerCase();
         setSteamLanguage(langPref);
         localStorage.setItem("steam_lang", langPref);
+        if (storedProvider === "local" || storedProvider === "ally") {
+          setAiProvider(storedProvider);
+        }
       } finally {
         if (!cancelled) {
           setSteamSettingsLoaded(true);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri) {
+      setAllyDataDir(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const [dir, lastExport, lastEmbed, lastStart] = await Promise.all([
+          allyGetDataDir(),
+          getSetting<string>("ally.lastExportISO"),
+          getSetting<string>("ally.lastEmbedISO"),
+          getSetting<string>("ally.lastStartISO"),
+        ]);
+        if (!cancelled) {
+          setAllyDataDir(dir);
+          setLastAllyExportISO(lastExport ?? null);
+          setLastAllyEmbedISO(lastEmbed ?? null);
+          setLastAllyStartISO(lastStart ?? null);
+        }
+      } catch (_err) {
+        if (!cancelled) {
+          setAllyDataDir("Unavailable");
         }
       }
     })();
@@ -109,6 +180,34 @@ export default function SettingsPage() {
     void setSetting("steam.lang", value);
     localStorage.setItem("steam_lang", value);
   }, [steamLanguage, steamSettingsLoaded]);
+
+  useEffect(() => {
+    // persist provider choice
+    void setSetting("ai.provider", aiProvider);
+  }, [aiProvider]);
+
+  useEffect(() => {
+    if (!isTauri || aiProvider !== "local") {
+      setLocalInfo(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const info = await localDetect();
+        if (!cancelled) {
+          setLocalInfo(info);
+        }
+      } catch (_err) {
+        if (!cancelled) {
+          setLocalInfo(null);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [aiProvider]);
 
   /** Feature flags: covers, IGDB, HLTB, OpenCritic.  Each flag lives in
    * localStorage as "0" or "1".  We provide simple toggles that update
@@ -257,6 +356,220 @@ export default function SettingsPage() {
         message: formatSteamError(err, "Steam API test failed."),
       });
     }
+  };
+
+  const toError = (err: unknown): string => {
+    if (err instanceof Error) return err.message;
+    if (typeof err === "string") return err;
+    try {
+      return JSON.stringify(err);
+    } catch {
+      return String(err);
+    }
+  };
+
+  const formatIso = (iso: string | null | undefined) =>
+    iso ? new Date(iso).toLocaleString() : "Never";
+
+  const renderStatusPill = (state: StepState) => {
+    const base = "inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold";
+    switch (state.status) {
+      case "pending":
+        return <span className={`${base} bg-amber-100 text-amber-700`}>Pending</span>;
+      case "success":
+        return <span className={`${base} bg-emerald-100 text-emerald-700`}>OK</span>;
+      case "error":
+        return <span className={`${base} bg-rose-100 text-rose-700`}>Error</span>;
+      default:
+        return <span className={`${base} bg-zinc-100 text-zinc-500`}>Idle</span>;
+    }
+  };
+
+  const runExportStep = async (label: string = ALLY_LABEL) => {
+    if (!isTauri) {
+      setAllyExportState({ status: "error", message: "Desktop-only feature.", error: "Desktop-only feature." });
+      return false;
+    }
+    try {
+      setAllyExportState({ status: "pending" });
+      const results = await exportAll(label);
+      setAllyExportResults(results);
+      const iso = new Date().toISOString();
+      await setSetting("ally.lastExportISO", iso);
+      setLastAllyExportISO(iso);
+      setAllyExportState({ status: "success", message: `Exported ${results.length} files.` });
+      return true;
+    } catch (err) {
+      const message = toError(err);
+      setAllyExportState({ status: "error", message: "Export failed.", error: message });
+      return false;
+    }
+  };
+
+  const runEmbedStep = async (label: string = ALLY_LABEL) => {
+    if (!isTauri) {
+      setAllyEmbedState({ status: "error", message: "Desktop-only feature.", error: "Desktop-only feature." });
+      return false;
+    }
+    setAllyEmbedState({ status: "pending" });
+    try {
+      if (aiProvider === "local") {
+        // Build simple corpus: identity titles
+        const idents = await db.identities.toArray();
+        const texts = idents.map((i) => i.title).filter(Boolean).slice(0, 500);
+        const vectors = await localEmbed(texts);
+        // Persist to Ally data dir to keep locations consistent
+        const payload = JSON.stringify({ label, count: texts.length, dim: vectors[0]?.length ?? 0, texts, vectors });
+        await allyWriteExport(label, "vectors.json", payload);
+        setAllyEmbedOutput(`Embedded ${texts.length} items locally (dim=${vectors[0]?.length ?? 0}).`);
+      } else {
+        const output = (await allyEmbed(label)).trim();
+        setAllyEmbedOutput(output || null);
+      }
+      const iso = new Date().toISOString();
+      await setSetting("ally.lastEmbedISO", iso);
+      setLastAllyEmbedISO(iso);
+      setAllyEmbedState({ status: "success", message: "Embed complete." });
+      return true;
+    } catch (err) {
+      const message = toError(err);
+      setAllyEmbedState({ status: "error", message: "Embed failed.", error: message });
+      return false;
+    }
+  };
+
+  const runStartStep = async (label: string = ALLY_LABEL) => {
+    if (!isTauri) {
+      setAllyStartState({ status: "error", message: "Desktop-only feature.", error: "Desktop-only feature." });
+      return false;
+    }
+    setAllyStartState({ status: "pending" });
+    try {
+      if (aiProvider === "local") {
+        // For local, write a small KB marker file so UI can confirm state
+        const marker = JSON.stringify({ label, startedAt: new Date().toISOString(), provider: "local" });
+        await allyWriteExport(label, "kb.json", marker);
+        setAllyStartOutput("Local KB ready.");
+      } else {
+        const output = (await allyStartRag(label)).trim();
+        setAllyStartOutput(output || null);
+      }
+      const iso = new Date().toISOString();
+      await setSetting("ally.lastStartISO", iso);
+      setLastAllyStartISO(iso);
+      setAllyStartState({ status: "success", message: "Knowledge base started." });
+      return true;
+    } catch (err) {
+      const message = toError(err);
+      setAllyStartState({ status: "error", message: "Start failed.", error: message });
+      return false;
+    }
+  };
+
+  const handleAllyExportNow = async () => {
+    await runExportStep();
+  };
+
+  const handleAllyEmbed = async () => {
+    await runEmbedStep();
+  };
+
+  const handleAllyStart = async () => {
+    await runStartStep();
+  };
+
+  const handleLocalChatTest = async () => {
+    if (!isTauri || aiProvider !== "local") {
+      setLocalChatState({ status: "error", message: "Switch provider to Local to run this test.", error: "Local provider inactive." });
+      return;
+    }
+    try {
+      setLocalChatState({ status: "pending" });
+      const reply = await localChat("Hello! Please confirm the local model is online.");
+      setLocalChatOutput(reply);
+      setLocalChatState({ status: "success", message: "Reply received." });
+    } catch (err) {
+      setLocalChatState({ status: "error", message: "Local chat failed.", error: toError(err) });
+    }
+  };
+
+  const handleLocalEmbedTest = async () => {
+    if (!isTauri || aiProvider !== "local") {
+      setLocalEmbedState({ status: "error", message: "Switch provider to Local to run this test.", error: "Local provider inactive." });
+      return;
+    }
+    try {
+      setLocalEmbedState({ status: "pending" });
+      const sample = await db.identities.orderBy("title").limit(3).toArray();
+      const texts = sample.length ? sample.map((entry) => entry.title ?? "") : ["Sample text", "Another sample", "Final sample"];
+      const vectors = await localEmbed(texts);
+      const dim = vectors[0]?.length ?? 0;
+      setLocalEmbedSummary(`Generated ${vectors.length} vectors (dim ${dim}).`);
+      setLocalEmbedState({ status: "success", message: "Embeddings generated." });
+    } catch (err) {
+      setLocalEmbedState({ status: "error", message: "Local embedding failed.", error: toError(err) });
+    }
+  };
+
+  const handleRunAll = async () => {
+    if (!isTauri) {
+      setAllyExportState({ status: "error", message: "Desktop-only feature.", error: "Desktop-only feature." });
+      return;
+    }
+    setBootstrapRunning(true);
+    try {
+      const exportOk = await runExportStep();
+      if (!exportOk) return;
+      const embedOk = await runEmbedStep();
+      if (!embedOk) return;
+      await runStartStep();
+    } finally {
+      setBootstrapRunning(false);
+    }
+  };
+
+  const handleChatSend = async () => {
+    const trimmed = chatInput.trim();
+    if (!trimmed) return;
+    if (!isTauri) {
+      setChatState({ status: "error", message: "Desktop-only feature.", error: "Desktop-only feature." });
+      return;
+    }
+    const session = getOrCreateSession();
+    setChatSession(session);
+    setChatState({ status: "pending" });
+    setChatHistory((prev) => [...prev, { role: "user", content: trimmed }]);
+    try {
+      const raw = aiProvider === "local"
+        ? await localChat(trimmed)
+        : await allyChat(session, trimmed, false);
+      let content = raw.trim();
+      let isJson = false;
+      if (content) {
+        try {
+          const parsed = JSON.parse(content);
+          content = JSON.stringify(parsed, null, 2);
+          isJson = true;
+        } catch {
+          isJson = false;
+        }
+      }
+      setChatState({ status: "success", message: `Reply received (${content.length} chars).` });
+      setChatResponse({ content, isJson });
+      setChatHistory((prev) => [...prev, { role: "ally", content, isJson }]);
+      setChatInput("");
+    } catch (err) {
+      const message = toError(err);
+      setChatState({ status: "error", message: "Chat failed.", error: message });
+    }
+  };
+
+  const handleResetChatSession = () => {
+    resetSession();
+    setChatSession(null);
+    setChatHistory([]);
+    setChatResponse(null);
+    setChatState({ status: "idle" });
   };
 
   /**
@@ -454,6 +767,364 @@ export default function SettingsPage() {
           When all vendors are enabled the enrichment pipeline tries Steam → HLTB → RAWG for playtime and
           Metacritic → OpenCritic for critic scores.
         </p>
+      </section>
+
+      <section className="space-y-3">
+        <h2 className="text-lg font-medium">AI / Ally</h2>
+        <div className="space-y-3 rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
+          {isTauri ? (
+            <>
+              <div className="flex flex-wrap items-center gap-3">
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={async () => {
+                    try {
+                      setAllyState({ status: "pending" });
+                      const v = await allyVersion();
+                      setAllyState({ status: "success", message: v || "ally" });
+                    } catch (err) {
+                      const message = toError(err);
+                      setAllyState({ status: "error", message: "Test failed.", error: message });
+                    }
+                  }}
+                  disabled={allyState.status === "pending"}
+                >
+                  {allyState.status === "pending" ? "Testing..." : "Test Ally"}
+                </button>
+                {renderStatusPill(allyState)}
+                {allyState.message ? (
+                  <span className="text-sm text-zinc-600">{allyState.message}</span>
+                ) : null}
+              </div>
+              <div className="flex flex-wrap items-center gap-3">
+                <label className="text-sm text-zinc-700">Provider</label>
+                <label className="inline-flex items-center gap-2 text-sm">
+                  <input type="radio" name="ai_provider" checked={aiProvider === 'local'} onChange={() => setAiProvider('local')} />
+                  <span>Local (llama.cpp)</span>
+                </label>
+                <label className="inline-flex items-center gap-2 text-sm">
+                  <input type="radio" name="ai_provider" checked={aiProvider === 'ally'} onChange={() => setAiProvider('ally')} />
+                  <span>Ally (Python)</span>
+                </label>
+              </div>
+              {aiProvider === "local" ? (
+                <div className="rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-xs text-zinc-600">
+                  <p className="font-semibold text-zinc-700">Local models</p>
+                  {localInfo ? (
+                    <div className="mt-1 space-y-1">
+                      <p>
+                        Chat model: <span className="font-mono text-zinc-800">{localInfo.chat_path}</span>{" "}
+                        {localInfo.chat_exists ? (
+                          <span className="text-emerald-600">(found)</span>
+                        ) : (
+                          <span className="text-rose-600">(missing)</span>
+                        )}
+                      </p>
+                      <p>
+                        Embed model: <span className="font-mono text-zinc-800">{localInfo.embed_path}</span>{" "}
+                        {localInfo.embed_exists ? (
+                          <span className="text-emerald-600">(found)</span>
+                        ) : (
+                          <span className="text-rose-600">(missing)</span>
+                        )}
+                      </p>
+                      {localInfo.found?.length ? (
+                        <details className="text-[11px] text-zinc-500">
+                          <summary className="cursor-pointer">All .gguf files</summary>
+                          <ul className="mt-1 space-y-0.5">
+                            {localInfo.found.map((entry) => (
+                              <li key={entry} className="font-mono text-[11px] text-zinc-600">
+                                {entry}
+                              </li>
+                            ))}
+                          </ul>
+                        </details>
+                      ) : null}
+                    </div>
+                  ) : (
+                    <p className="mt-1">Searching for models…</p>
+                  )}
+                </div>
+              ) : null}
+              {allyState.status === "error" && allyState.error ? (
+                <details className="rounded-lg border border-rose-100 bg-rose-50 px-3 py-2 text-xs text-rose-700">
+                  <summary className="cursor-pointer font-semibold">Error details</summary>
+                  <pre className="mt-2 whitespace-pre-wrap text-rose-700">{allyState.error}</pre>
+                </details>
+              ) : null}
+
+              <div className="text-xs text-zinc-500">
+                <div>
+                  Data directory: {allyDataDir ? (
+                    <span className="font-mono text-zinc-700">{allyDataDir}</span>
+                  ) : (
+                    "Resolving..."
+                  )}
+                </div>
+                <div>Last export: {formatIso(lastAllyExportISO)}</div>
+                <div>Last embed: {formatIso(lastAllyEmbedISO)}</div>
+                <div>Last knowledge base start: {formatIso(lastAllyStartISO)}</div>
+              </div>
+
+              {aiProvider === "local" ? (
+                <div className="rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2">
+                  <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-500">Local sanity checks</h3>
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      className="btn-ghost"
+                      onClick={handleLocalChatTest}
+                      disabled={localChatState.status === "pending"}
+                    >
+                      {localChatState.status === "pending" ? "Testing chat..." : "Test local chat"}
+                    </button>
+                    {renderStatusPill(localChatState)}
+                    {localChatState.message ? (
+                      <span className="text-xs text-zinc-500">{localChatState.message}</span>
+                    ) : null}
+                  </div>
+                  {localChatState.status === "error" && localChatState.error ? (
+                    <details className="mt-1 text-xs text-rose-700">
+                      <summary className="cursor-pointer font-semibold">Chat error</summary>
+                      <pre className="mt-1 whitespace-pre-wrap">{localChatState.error}</pre>
+                    </details>
+                  ) : null}
+                  {localChatOutput ? (
+                    <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap rounded border border-zinc-200 bg-white px-2 py-1 text-xs text-zinc-700">
+                      {localChatOutput}
+                    </pre>
+                  ) : null}
+
+                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      className="btn-ghost"
+                      onClick={handleLocalEmbedTest}
+                      disabled={localEmbedState.status === "pending"}
+                    >
+                      {localEmbedState.status === "pending" ? "Computing embeddings..." : "Test local embedding"}
+                    </button>
+                    {renderStatusPill(localEmbedState)}
+                    {localEmbedState.message ? (
+                      <span className="text-xs text-zinc-500">{localEmbedState.message}</span>
+                    ) : null}
+                  </div>
+                  {localEmbedState.status === "error" && localEmbedState.error ? (
+                    <details className="mt-1 text-xs text-rose-700">
+                      <summary className="cursor-pointer font-semibold">Embedding error</summary>
+                      <pre className="mt-1 whitespace-pre-wrap">{localEmbedState.error}</pre>
+                    </details>
+                  ) : null}
+                  {localEmbedSummary ? (
+                    <p className="mt-1 text-xs text-emerald-600">{localEmbedSummary}</p>
+                  ) : null}
+                </div>
+              ) : null}
+
+              <div className="space-y-3 border-t border-zinc-200 pt-3">
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-500">Knowledge base bootstrap</h3>
+                <div className="space-y-2">
+                  <div className="rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-semibold text-zinc-800">1. Export library JSON</div>
+                        <div className="text-xs text-zinc-500">Last run {formatIso(lastAllyExportISO)}</div>
+                        {allyExportState.status === "success" && allyExportState.message ? (
+                          <p className="mt-1 text-xs text-emerald-600">{allyExportState.message}</p>
+                        ) : null}
+                      </div>
+                      {renderStatusPill(allyExportState)}
+                    </div>
+                    {allyExportState.status === "error" && allyExportState.error ? (
+                      <details className="mt-2 text-xs text-rose-700">
+                        <summary className="cursor-pointer font-semibold">Error details</summary>
+                        <pre className="mt-1 whitespace-pre-wrap">{allyExportState.error}</pre>
+                      </details>
+                    ) : null}
+                  </div>
+
+                  <div className="rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-semibold text-zinc-800">2. Embed library into Ally</div>
+                        <div className="text-xs text-zinc-500">Last run {formatIso(lastAllyEmbedISO)}</div>
+                        {allyEmbedState.status === "success" && allyEmbedState.message ? (
+                          <p className="mt-1 text-xs text-emerald-600">{allyEmbedState.message}</p>
+                        ) : null}
+                      </div>
+                      {renderStatusPill(allyEmbedState)}
+                    </div>
+                    {allyEmbedState.status === "error" && allyEmbedState.error ? (
+                      <details className="mt-2 text-xs text-rose-700">
+                        <summary className="cursor-pointer font-semibold">Error details</summary>
+                        <pre className="mt-1 whitespace-pre-wrap">{allyEmbedState.error}</pre>
+                      </details>
+                    ) : null}
+                  </div>
+
+                  <div className="rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-semibold text-zinc-800">3. Start knowledge base session</div>
+                        <div className="text-xs text-zinc-500">Last run {formatIso(lastAllyStartISO)}</div>
+                        {allyStartState.status === "success" && allyStartState.message ? (
+                          <p className="mt-1 text-xs text-emerald-600">{allyStartState.message}</p>
+                        ) : null}
+                      </div>
+                      {renderStatusPill(allyStartState)}
+                    </div>
+                    {allyStartState.status === "error" && allyStartState.error ? (
+                      <details className="mt-2 text-xs text-rose-700">
+                        <summary className="cursor-pointer font-semibold">Error details</summary>
+                        <pre className="mt-1 whitespace-pre-wrap">{allyStartState.error}</pre>
+                      </details>
+                    ) : null}
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={handleRunAll}
+                    disabled={
+                      bootstrapRunning ||
+                      allyExportState.status === "pending" ||
+                      allyEmbedState.status === "pending" ||
+                      allyStartState.status === "pending"
+                    }
+                  >
+                    {bootstrapRunning ? "Running..." : "Run all (Export → Embed → Start)"}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-ghost"
+                    onClick={handleAllyExportNow}
+                    disabled={allyExportState.status === "pending" || bootstrapRunning}
+                  >
+                    Export only
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-ghost"
+                    onClick={handleAllyEmbed}
+                    disabled={allyEmbedState.status === "pending" || bootstrapRunning}
+                  >
+                    Embed only
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-ghost"
+                    onClick={handleAllyStart}
+                    disabled={allyStartState.status === "pending" || bootstrapRunning}
+                  >
+                    Start KB only
+                  </button>
+                </div>
+
+                {allyExportResults.length ? (
+                  <div className="overflow-x-auto">
+                    <table className="min-w-[16rem] text-left text-xs">
+                      <thead>
+                        <tr className="text-zinc-500">
+                          <th className="px-2 py-1">File</th>
+                          <th className="px-2 py-1 text-right">Bytes</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {allyExportResults.map((entry) => (
+                          <tr key={entry.file} className="border-t border-zinc-200">
+                            <td className="px-2 py-1 font-mono text-zinc-700">{entry.file}</td>
+                            <td className="px-2 py-1 text-right text-zinc-600">{entry.bytes.toLocaleString()}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : null}
+
+                {allyEmbedOutput ? (
+                  <details className="rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-xs text-zinc-600">
+                    <summary className="cursor-pointer font-semibold text-zinc-700">Embed output</summary>
+                    <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap text-zinc-700">{allyEmbedOutput}</pre>
+                  </details>
+                ) : null}
+
+                {allyStartOutput ? (
+                  <details className="rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-xs text-zinc-600">
+                    <summary className="cursor-pointer font-semibold text-zinc-700">Start output</summary>
+                    <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap text-zinc-700">{allyStartOutput}</pre>
+                  </details>
+                ) : null}
+              </div>
+
+              <div className="space-y-3 border-t border-zinc-200 pt-3">
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-500">Chat smoke test</h3>
+                {chatSession ? (
+                  <p className="text-xs text-zinc-500">
+                    Active session: <span className="font-mono text-zinc-700">{chatSession}</span>
+                  </p>
+                ) : (
+                  <p className="text-xs text-zinc-500">Session starts when you send your first message.</p>
+                )}
+                <textarea
+                  className="w-full rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-700 shadow-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                  rows={3}
+                  placeholder="Ask Ally something about your library..."
+                  value={chatInput}
+                  onChange={(event) => setChatInput(event.target.value)}
+                />
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={handleChatSend}
+                    disabled={chatState.status === "pending" || !chatInput.trim()}
+                  >
+                    {chatState.status === "pending" ? "Sending..." : "Send"}
+                  </button>
+                  <button type="button" className="btn-ghost" onClick={handleResetChatSession}>
+                    Reset session
+                  </button>
+                  {renderStatusPill(chatState)}
+                </div>
+                {chatState.message ? (
+                  <p className="text-xs text-zinc-500">{chatState.message}</p>
+                ) : null}
+                {chatState.status === "error" && chatState.error ? (
+                  <details className="rounded-lg border border-rose-100 bg-rose-50 px-3 py-2 text-xs text-rose-700">
+                    <summary className="cursor-pointer font-semibold">Error details</summary>
+                    <pre className="mt-2 whitespace-pre-wrap text-rose-700">{chatState.error}</pre>
+                  </details>
+                ) : null}
+                {chatResponse ? (
+                  <div className="rounded-lg border border-zinc-200 bg-zinc-50 p-3">
+                    <h4 className="text-xs font-semibold uppercase tracking-wide text-zinc-500">Latest reply</h4>
+                    <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap text-sm text-zinc-800">
+                      {chatResponse.content || "(empty)"}
+                    </pre>
+                  </div>
+                ) : null}
+                {chatHistory.length ? (
+                  <div className="space-y-1 text-xs text-zinc-600">
+                    <h4 className="font-semibold uppercase tracking-wide text-zinc-500">History</h4>
+                    {chatHistory.map((entry, index) => (
+                      <div key={index} className="rounded border border-zinc-200 bg-white px-2 py-1">
+                        <span className="font-semibold text-zinc-700">{entry.role === "user" ? "You" : "Ally"}:</span>
+                        <span className="ml-1 whitespace-pre-wrap font-mono text-zinc-700">
+                          {entry.content || "(empty)"}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            </>
+          ) : (
+            <p className="text-sm text-zinc-600">AI sidecar requires desktop build.</p>
+          )}
+        </div>
       </section>
 
       {/* Card layout fixed to "Large" size.  The card width is set globally to 340px via CSS. */}
@@ -694,3 +1365,5 @@ export default function SettingsPage() {
     </div>
   );
 }
+
+

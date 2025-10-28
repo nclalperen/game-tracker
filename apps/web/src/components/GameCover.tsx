@@ -1,6 +1,8 @@
-﻿import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { Identity } from "@tracker/core";
 import { ensureRawgDetail } from "@/data/rawgCache";
+
+const coverStatusCache = new Map<string, "ok" | "fail">();
 
 type Size = "xs" | "sm" | "md" | "lg";
 
@@ -77,18 +79,20 @@ export default function GameCover({
         `https://cdn.akamai.steamstatic.com/steam/apps/${appid}/library_600x900.jpg`,
         `https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/${appid}/library_600x900.jpg`,
         `https://cdn.akamai.steamstatic.com/steam/apps/${appid}/header.jpg`,
-        `https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/${appid}/header.jpg`
+        `https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/${appid}/header.jpg`,
+        `https://cdn.cloudflare.steamstatic.com/steam/apps/${appid}/capsule_616x353.jpg`,
+        `https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/${appid}/capsule_616x353.jpg`
       );
+    }
+    if (rawgImage) {
+      urls.push(rawgImage);
     }
     if (igdbCoverId) {
       urls.push(
         `https://images.igdb.com/igdb/image/upload/t_cover_big/${igdbCoverId}.jpg`
       );
     }
-    if (rawgImage) {
-      urls.push(rawgImage);
-    }
-    return urls;
+    return urls.filter((url) => coverStatusCache.get(url) !== "fail");
   }, [appid, igdbCoverId, rawgImage]);
 
   const [idx, setIdx] = useState(0);
@@ -119,6 +123,8 @@ export default function GameCover({
     </div>
   );
 }
+
+
 
 
 

@@ -1,0 +1,11 @@
+{
+  "$schema": "https://schemas.tauri.app/capabilities/1.0.0.json",
+  "identifier": "event-listen",
+  "description": "Allow session bridge to listen for Tauri core events.",
+  "windows": ["main"],
+  "webviews": ["main"],
+  "permissions": [
+    "core:event:default",
+    "core:event:allow-listen"
+  ]
+}

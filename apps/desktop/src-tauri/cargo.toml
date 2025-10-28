@@ -11,11 +11,31 @@ strsim = "0.10"
 tauri = { version = "2.9.0", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.11", default-features = false, features = ["json", "gzip", "rustls-tls", "blocking"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "gzip", "rustls-tls", "cookies", "blocking"] }
 dirs = "5"
 regex = "1.11"
 urlencoding = "2.1"
+thiserror = "1"
+vdf-serde = "0.3"
+dotenvy = "0.15"
+chrono = { version = "0.4", features = ["serde"] }
+windows = { version = "0.54", features = [
+  "Win32_Foundation",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Threading",
+  "Win32_UI_WindowsAndMessaging"
+] }
+
+# Optional local LLM runtime (feature-gated). Leaving it commented keeps default builds unchanged.
+# Enable with: cargo build --features local-llm
+# llama_cpp = { version = "0.3", optional = true }
+
+[features]
+default = []
+local-llm = []
 
 [build-dependencies]
 tauri-build = { version = "2.5.0", features = [] }
-
+ureq = { version = "2.9.6", default-features = false, features = ["tls", "json"] }
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+serde_json = "1"

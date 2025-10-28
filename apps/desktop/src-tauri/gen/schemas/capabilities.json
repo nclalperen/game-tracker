@@ -1,1 +1,1 @@
-{}
+{"event-listen":{"identifier":"event-listen","description":"Allow session bridge to listen for Tauri core events.","local":true,"windows":["main"],"webviews":["main"],"permissions":["core:event:default","core:event:allow-listen"]}}

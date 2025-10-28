@@ -9,14 +9,20 @@ const PLATFORM_ALIASES: Array<[RegExp, string]> = [
   [/linux|steam deck/i, "linux"],
 ];
 
-const HOST_HINTS: Array<[RegExp, string]> = [
-  [/steampowered\.com|steamcommunity\.com|epicgames\.com|gog\.com|ubisoft\.com|humblebundle\.com/i, "pc"],
-  [/store\.playstation\.com/i, "ps5"],
-  [/xbox\.com|microsoft\.com/i, "xsx"],
-  [/nintendo\.(com|co\.)/i, "switch"],
+const HOST_HINTS: Array<[RegExp, (year?: number | null) => string]> = [
+  [/steampowered\.com|steamcommunity\.com|epicgames\.com|gog\.com|ubisoft\.com|humblebundle\.com/i, () => "pc"],
+  [/store\.playstation\.com/i, (year) => {
+    if (year == null) return "ps5";
+    return year >= 2020 ? "ps5" : "ps4";
+  }],
+  [/xbox\.com|microsoft\.com/i, (year) => {
+    if (year == null) return "xsx";
+    return year >= 2020 ? "xsx" : "xboxone";
+  }],
+  [/nintendo\.(com|co\.)/i, () => "switch"],
 ];
 
-export function canonicalPlatform(input?: string | null, urlHost?: string | null): string {
+export function canonicalPlatform(input?: string | null, urlHost?: string | null, releaseYear?: number | null): string {
   if (input) {
     for (const [pattern, value] of PLATFORM_ALIASES) {
       if (pattern.test(input)) {
@@ -26,13 +32,12 @@ export function canonicalPlatform(input?: string | null, urlHost?: string | null
   }
 
   if (urlHost) {
-    for (const [pattern, value] of HOST_HINTS) {
+    for (const [pattern, resolver] of HOST_HINTS) {
       if (pattern.test(urlHost)) {
-        return value;
+        return resolver(releaseYear ?? undefined);
       }
     }
   }
 
   return "unknown";
 }
-

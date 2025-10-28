@@ -17,7 +17,9 @@
   },
   "bundle": {
     "active": true,
+    "icon": ["icons/icon.ico"],
     "targets": ["msi"],
-    "windows": { "webviewInstallMode": { "type": "downloadBootstrapper" } }
+    "windows": { "webviewInstallMode": { "type": "downloadBootstrapper" } },
+    "resources": ["bin/ally/**/*", "bin/llama/**/*", "models/**/*"]
   }
 }

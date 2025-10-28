@@ -16,6 +16,8 @@ export type Identity = {
   criticScoreSource?: "metacritic" | "opencritic" | "rawg";
   rawgId?: number | null;
   rawgSlug?: string | null;
+  enrichmentSessionId?: string | null;
+  enrichmentPartial?: boolean;
 };
 
 export type LibraryItem = {
@@ -31,6 +33,14 @@ export type LibraryItem = {
   ocScore?: number;
   mcScore?: number;
   ttbMedianMainH?: number;
+  playtimeForeverMin?: number;
+  playtimeTwoWeeksMin?: number | null;
+  lastPlayedAtISO?: string | null;
+  source?: string;
+  installed?: boolean;
+  installPath?: string | null;
+  installDir?: string | null;
+  sizeOnDisk?: number | null;
 };
 
 

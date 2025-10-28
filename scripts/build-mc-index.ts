@@ -1,7 +1,7 @@
 ﻿import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseCsvStream, sniffCsv } from "./csv/smartCsv";
+import { alias, parseCsvStream, sniffCsv } from "./csv/smartCsv";
 import { canonicalPlatform } from "../packages/core/src/data/platforms";
 import { normalizeTitle } from "../packages/core/src/data/normalizeTitle";
 
@@ -10,7 +10,7 @@ type MCValue = {
   platform?: string;
   url?: string;
   year?: number;
-  genres?: string;
+  genres?: string[];
 };
 
 type Candidate = {
@@ -27,26 +27,6 @@ const __dirname = path.dirname(__filename);
 const ROOT = path.resolve(__dirname, "..");
 const INPUT = path.resolve(ROOT, "apps/web/public/hookdata/games.csv");
 const OUTPUT = path.resolve(ROOT, "apps/web/public/hookdata/metacritic.index.json");
-
-const COLUMN_ALIASES: Record<string, string[]> = {
-  title: ["title", "name"],
-  platform: ["platform", "platform_name", "system"],
-  score: ["metascore", "score", "metacritic"],
-  url: ["url", "link"],
-  year: ["year", "release_year", "released", "date"],
-  genres: ["genres", "tags"],
-};
-
-function readColumn(row: Record<string, string>, key: keyof typeof COLUMN_ALIASES): string | undefined {
-  const lookup = COLUMN_ALIASES[key];
-  for (const candidate of lookup) {
-    const value = row[candidate];
-    if (value != null && value !== "") {
-      return value.trim();
-    }
-  }
-  return undefined;
-}
 
 function parseYear(value: string | undefined): number | undefined {
   if (!value) return undefined;
@@ -95,13 +75,30 @@ function chooseBetter(existing: Candidate, next: Candidate): Candidate {
   if (next.score > existing.score) return next;
   if (existing.score > next.score) return existing;
 
-  if (next.year != null && existing.year == null) return next;
-  if (existing.year != null && next.year == null) return existing;
+  if (existing.year == null && next.year != null) return next;
+  if (next.year == null && existing.year != null) return existing;
+  if (existing.year != null && next.year != null) {
+    const delta = Math.abs(existing.year - next.year);
+    if (delta > 1) {
+      return next.year > existing.year ? next : existing;
+    }
+  }
 
   if (next.url && !existing.url) return next;
   if (existing.url && !next.url) return existing;
 
   return existing;
+}
+
+function deriveSteamTitle(row: Record<string, string>, steamUrl: string): string | undefined {
+  const sourceCell = Object.values(row).find(
+    (value) => typeof value === "string" && value.includes(steamUrl),
+  );
+  if (!sourceCell) return undefined;
+  const idx = sourceCell.indexOf(steamUrl);
+  if (idx < 0) return undefined;
+  const slice = sourceCell.slice(0, Math.max(0, idx - 2));
+  return slice.replace(/[:\s]+$/, "").trim();
 }
 
 async function main() {
@@ -118,23 +115,43 @@ async function main() {
 
   for await (const row of parseCsvStream(INPUT, { columnsCase: "lower", tolerateUnbalancedQuotes: true })) {
     processedRows += 1;
-    const titleRaw = readColumn(row, "title");
-    const scoreRaw = readColumn(row, "score");
-    if (!titleRaw || !scoreRaw) continue;
+    const scoreRaw = alias(row, "score");
+    if (!scoreRaw) continue;
+
+    let titleRaw = alias(row, "title");
+    let urlRaw = alias(row, "url");
+
+    const steamCell = Object.values(row).find(
+      (value) => typeof value === "string" && value.includes("store.steampowered.com"),
+    );
+    if (steamCell) {
+      const urlMatch = steamCell.match(/https?:\/\/store\.steampowered\.com\/[\S]+/i);
+      if (urlMatch?.[0]) {
+        urlRaw = urlMatch[0];
+        const steamTitle = deriveSteamTitle(row, urlMatch[0]);
+        if (steamTitle) {
+          titleRaw = steamTitle;
+        }
+      }
+    }
+
+    if (!titleRaw) {
+      titleRaw = steamCell ?? alias(row, "title");
+    }
+    if (!titleRaw) continue;
 
     const normalizedTitle = normalizeTitle(titleRaw);
     if (!normalizedTitle) continue;
 
-    const urlRaw = readColumn(row, "url");
-    const host = tryParseHost(urlRaw);
-    const platformRaw = readColumn(row, "platform");
-    const platform = canonicalPlatform(platformRaw, host);
-
     const score = parseScore(scoreRaw);
     if (score == null) continue;
 
-    const year = parseYear(readColumn(row, "year"));
-    const genres = parseGenres(readColumn(row, "genres"));
+    const year = parseYear(alias(row, "year"));
+    const genres = parseGenres(alias(row, "tags"));
+
+    const host = tryParseHost(urlRaw ?? undefined);
+    const platformRaw = alias(row, "platform");
+    const platform = canonicalPlatform(platformRaw, host, year);
 
     const key = `${normalizedTitle}|${platform}`;
 
@@ -162,7 +179,7 @@ async function main() {
       platform: value.canonicalPlatform !== "unknown" ? value.canonicalPlatform : undefined,
       url: value.url,
       year: value.year,
-      genres: value.genres?.join(", "),
+      genres: value.genres,
     };
   }
 

@@ -4,6 +4,7 @@ export { canonicalPlatform } from "./data/platforms";
 
 export function pricePerHour(priceTRY?: number, ttbMedianMainH?: number): number | null {
   if (priceTRY == null || ttbMedianMainH == null) return null;
+  if (priceTRY <= 0) return null;
   if (ttbMedianMainH <= 0) return null;
   return Math.round(priceTRY / ttbMedianMainH);
 }

@@ -9,3 +9,6 @@ export * from './importers';
 export * from "./dedupe";
 export * from "./data/normalizeTitle";
 export * from "./data/platforms";
+export * from "./finishPlanner";
+export * from "./data/steamIndex";
+export * from "./ally/schemas";

@@ -1,6 +1,15 @@
-﻿import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import Modal from "./Modal";
-import { db, type EnrichStatus } from "@/db";
+import {
+  db,
+  getSetting,
+  replaceSteamOwnedRows,
+  replaceSteamRecentRows,
+  setSetting,
+  type EnrichStatus,
+  type SteamOwnedRow,
+  type SteamRecentRow,
+} from "@/db";
 import {
   useEnrichmentRunner,
   type EnrichRow,
@@ -8,12 +17,22 @@ import {
 } from "@/state/enrichmentRunner";
 import { isTauri } from "@/desktop/bridge";
 import {
+  ensureSteamId,
+  getOwnedGames,
+  getRecentlyPlayed,
+  scanSteamManifests,
+  type SteamInstallInfo,
+  type SteamRecentlyPlayed,
+} from "@/desktop/steamBridge";
+import {
   readCSV,
   rowsToEntities,
   type FieldMap,
   type IncomingRow,
   type Identity,
   type LibraryItem,
+  type Account,
+  nanoid,
 } from "@tracker/core";
 
 type Step = "source" | "map" | "review" | "enrich";
@@ -24,6 +43,13 @@ const STEP_LABELS: Record<Step, string> = {
   map: "Map columns",
   review: "Review & import",
   enrich: "Enrich metadata",
+};
+
+const STEAM_ACCOUNT_ID = "steam";
+const STEAM_ACCOUNT: Account = {
+  id: STEAM_ACCOUNT_ID,
+  label: "Steam",
+  platform: "PC",
 };
 
 type ImportWizardProps = {
@@ -47,8 +73,12 @@ export default function ImportWizard({ open, onClose, onImported }: ImportWizard
   const [error, setError] = useState<string | null>(null);
   const [pendingEnrichRows, setPendingEnrichRows] = useState<EnrichRow[]>([]);
   const [autoStartEnrich, setAutoStartEnrich] = useState(true);
+  const [steamId, setSteamId] = useState<string | null>(null);
+  const [steamRegion, setSteamRegion] = useState("us");
+  const [steamReady, setSteamReady] = useState(false);
+  const [steamImporting, setSteamImporting] = useState(false);
 
-  const { snapshot, start, pause, resume, cancel } = useEnrichmentRunner();
+  const { snapshot, start, pause, resume, halt } = useEnrichmentRunner();
 
   const columns = useMemo(() => {
     const keys = new Set<string>();
@@ -69,6 +99,34 @@ export default function ImportWizard({ open, onClose, onImported }: ImportWizard
       setStep("source");
     }
   }, [open, snapshot.sessionId, rawRows.length]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!open || !isTauri) {
+      setSteamReady(false);
+      return;
+    }
+    (async () => {
+      try {
+        const [storedId, storedRegion] = await Promise.all([
+          getSetting<string>("steam.myId"),
+          getSetting<string>("steam.region"),
+        ]);
+        if (cancelled) return;
+        setSteamId(storedId ?? null);
+        const region = (storedRegion || localStorage.getItem("steam_cc") || "us").toLowerCase();
+        setSteamRegion(region);
+        setSteamReady(Boolean(storedId));
+      } catch {
+        if (!cancelled) {
+          setSteamReady(false);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
 
   const resetWizard = () => {
     setFileName("");
@@ -109,6 +167,193 @@ export default function ImportWizard({ open, onClose, onImported }: ImportWizard
       setError(null);
     } catch (err: any) {
       setError(err?.message || "Failed to read file.");
+    }
+  };
+
+  const formatSteamError = (err: unknown, fallback: string) => {
+    const raw =
+      typeof err === "string" ? err : (err as { message?: string })?.message ?? fallback;
+    if (typeof raw !== "string") return fallback;
+    if (raw.toLowerCase().includes("player not found")) {
+      return "Steam could not find that profile. Update the saved Steam ID in Settings and ensure the profile is public.";
+    }
+    if (raw.toLowerCase().includes("missing") && raw.toLowerCase().includes("api key")) {
+      return "Steam API key is not configured. Add STEAM_WEB_API_KEY in your desktop environment.";
+    }
+    return raw;
+  };
+
+  const handleSteamImport = async () => {
+    if (!isTauri) {
+      setError("Steam import requires the desktop app.");
+      return;
+    }
+    if (!steamId) {
+      setError("Save your Steam ID in Settings before importing from Steam.");
+      return;
+    }
+    setSteamImporting(true);
+    setError(null);
+    try {
+      const { id: normalizedId, resolved } = await ensureSteamId(steamId);
+      if (resolved || normalizedId !== steamId) {
+        await setSetting("steam.myId", normalizedId);
+        setSteamId(normalizedId);
+      }
+      setSteamReady(true);
+      await db.accounts.put(STEAM_ACCOUNT);
+      const [owned, installs, recentlyPlayed] = await Promise.all([
+        getOwnedGames(normalizedId, true),
+        scanSteamManifests().catch(() => [] as SteamInstallInfo[]),
+        getRecentlyPlayed(normalizedId).catch(() => [] as SteamRecentlyPlayed[]),
+      ]);
+      if (!owned.length) {
+        setError("Steam did not return any owned games (library may be private).");
+        setSteamImporting(false);
+        return;
+      }
+      const timestamp = new Date().toISOString();
+      const ownedRows: SteamOwnedRow[] = owned.map((game) => ({
+        steamid: normalizedId,
+        appid: game.appId,
+        name: game.name,
+        playtimeForeverMin: game.playtimeForeverMin,
+        playtimeTwoWeeksMin: game.playtimeTwoWeeksMin ?? null,
+        lastPlayedAt: game.lastPlayedAt ?? null,
+        hasVisibleStats: game.hasVisibleStats,
+        iconHash: game.iconHash ?? null,
+        logoHash: game.logoHash ?? null,
+        playtimeWindowsMin: game.playtimeWindowsMin ?? null,
+        playtimeMacMin: game.playtimeMacMin ?? null,
+        playtimeLinuxMin: game.playtimeLinuxMin ?? null,
+        contentDescriptorIds: game.contentDescriptorIds ?? null,
+        lastFetchedISO: timestamp,
+      }));
+      await replaceSteamOwnedRows(normalizedId, ownedRows);
+
+      const recentRows: SteamRecentRow[] = recentlyPlayed.map((game) => ({
+        steamid: normalizedId,
+        appid: game.appId,
+        name: game.name,
+        playtimeTwoWeeksMin: game.playtimeTwoWeeksMin ?? null,
+        playtimeForeverMin: game.playtimeForeverMin ?? null,
+        lastPlayedAt: game.lastPlayedAt ?? null,
+        iconHash: game.iconHash ?? null,
+        logoHash: game.logoHash ?? null,
+        lastFetchedISO: timestamp,
+      }));
+      if (recentRows.length) {
+        await replaceSteamRecentRows(normalizedId, recentRows);
+      }
+      const installMap = new Map<number, SteamInstallInfo>();
+      installs.forEach((install) => {
+        if (install.appId) {
+          installMap.set(install.appId, install);
+        }
+      });
+      const appIds = owned
+        .map((game) => game.appId)
+        .filter((id): id is number => typeof id === "number" && Number.isFinite(id) && id > 0);
+      const existingIdentities = appIds.length
+        ? await db.identities.where("appid").anyOf(appIds).toArray()
+        : [];
+      const existingByAppId = new Map(existingIdentities.map((identity) => [identity.appid!, identity]));
+      const existingLibrary = existingIdentities.length
+        ? await db.library.where("identityId").anyOf(existingIdentities.map((i) => i.id)).toArray()
+        : [];
+      const libraryByIdentity = new Map<string, LibraryItem>();
+      for (const item of existingLibrary) {
+        const current = libraryByIdentity.get(item.identityId);
+        const accountIsSteam = (item.accountId ?? "").toLowerCase() === STEAM_ACCOUNT_ID;
+        if (!current || (accountIsSteam && (current.accountId ?? "").toLowerCase() !== STEAM_ACCOUNT_ID)) {
+          libraryByIdentity.set(item.identityId, item);
+        }
+      }
+      const identityMap = new Map<string, Identity>();
+      const libraryMap = new Map<string, LibraryItem>();
+      for (const game of owned) {
+        if (!game.appId || game.appId <= 0) continue;
+        const existingIdentity = existingByAppId.get(game.appId);
+        const identityId = existingIdentity?.id ?? `steam-${game.appId}`;
+        const title = (existingIdentity?.title || game.name || `Steam App ${game.appId}`).trim();
+        if (!title) continue;
+        const identity: Identity = existingIdentity
+          ? {
+              ...existingIdentity,
+              title: existingIdentity.title || title,
+              platform: existingIdentity.platform ?? "PC",
+              appid: existingIdentity.appid ?? game.appId,
+            }
+          : {
+              id: identityId,
+              title,
+              platform: "PC",
+              appid: game.appId,
+            };
+        identityMap.set(identity.id, identity);
+        const existingLibraryItem = libraryByIdentity.get(identity.id);
+        const libraryId = existingLibraryItem?.id ?? nanoid();
+        const services = new Set<string>(existingLibraryItem?.services ?? []);
+        services.add("Steam");
+        const lastPlayedISO =
+          game.lastPlayedAt && Number.isFinite(game.lastPlayedAt)
+            ? new Date(game.lastPlayedAt * 1000).toISOString()
+            : existingLibraryItem?.lastPlayedAtISO;
+        const mergedLibrary: LibraryItem = existingLibraryItem
+          ? { ...existingLibraryItem }
+          : {
+              id: libraryId,
+              identityId: identity.id,
+              status: "Owned",
+              memberId: "everyone",
+            };
+        mergedLibrary.id = libraryId;
+        mergedLibrary.identityId = identity.id;
+        const previousAccountId = existingLibraryItem?.accountId ?? null;
+        mergedLibrary.accountId =
+          previousAccountId && previousAccountId.toLowerCase() !== STEAM_ACCOUNT_ID
+            ? previousAccountId
+            : STEAM_ACCOUNT_ID;
+        mergedLibrary.services = Array.from(services);
+        mergedLibrary.source = "steam";
+        mergedLibrary.playtimeForeverMin = game.playtimeForeverMin;
+        mergedLibrary.playtimeTwoWeeksMin = game.playtimeTwoWeeksMin ?? null;
+        mergedLibrary.lastPlayedAtISO = lastPlayedISO;
+        const install = installMap.get(game.appId);
+        if (install) {
+          mergedLibrary.installed = true;
+          mergedLibrary.installPath = install.installPath ?? undefined;
+          mergedLibrary.installDir = install.installDir ?? undefined;
+          mergedLibrary.sizeOnDisk = install.sizeOnDisk ?? undefined;
+        }
+        libraryMap.set(libraryId, mergedLibrary);
+      }
+      const identities = Array.from(identityMap.values());
+      const libraryItems = Array.from(libraryMap.values());
+      if (!libraryItems.length) {
+        setError("Steam library import produced no entries.");
+        setSteamImporting(false);
+        return;
+      }
+      await setSetting("steam.lastSyncAt", timestamp);
+      const identityById = new Map(identities.map((identity) => [identity.id, identity]));
+      const tasks: EnrichRow[] = libraryItems.map((item) => ({
+        id: item.id,
+        identityId: item.identityId,
+        title: identityById.get(item.identityId)?.title ?? "Untitled",
+        appid: identityById.get(item.identityId)?.appid,
+      }));
+      setPreview({ identities, library: libraryItems });
+      setPendingEnrichRows(tasks);
+      setFileName("Steam owned games");
+      setRawRows([]);
+      setFieldMap({});
+      setAutoStartEnrich(true);
+      setStep("review");
+    } catch (err: any) {
+      setError(formatSteamError(err, "Steam import failed."));
+    } finally {
+      setSteamImporting(false);
     }
   };
 
@@ -173,14 +418,14 @@ export default function ImportWizard({ open, onClose, onImported }: ImportWizard
       return;
     }
     if (snapshot.sessionId) {
-      setError("Enrichment already running. Pause or cancel it first.");
+      setError("Enrichment already running. Pause or halt it first.");
       return;
     }
-    const region = (localStorage.getItem("steam_cc") || "us").toLowerCase();
+    const region = steamRegion.toLowerCase();
     start(pendingEnrichRows, { region });
     setPendingEnrichRows([]);
     setAutoStartEnrich(true);
-  }, [pendingEnrichRows, snapshot.sessionId, start]);
+  }, [pendingEnrichRows, snapshot.sessionId, start, steamRegion]);
 
   const stepIndex = STEPS.indexOf(step);
 
@@ -210,6 +455,9 @@ export default function ImportWizard({ open, onClose, onImported }: ImportWizard
             fileName={fileName}
             onReset={resetWizard}
             onFile={handleFile}
+            onImportSteam={handleSteamImport}
+            steamAvailable={steamReady}
+            steamImporting={steamImporting}
           />
         )}
 
@@ -244,7 +492,7 @@ export default function ImportWizard({ open, onClose, onImported }: ImportWizard
             snapshot={snapshot}
             pause={pause}
             resume={resume}
-            cancel={cancel}
+            halt={halt}
           />
         )}
       </div>
@@ -256,10 +504,16 @@ function SourceStep({
   fileName,
   onFile,
   onReset,
+  onImportSteam,
+  steamAvailable,
+  steamImporting,
 }: {
   fileName: string;
   onFile: (file: File) => void;
   onReset: () => void;
+  onImportSteam: () => void;
+  steamAvailable: boolean;
+  steamImporting: boolean;
 }) {
   return (
     <div className="space-y-4">
@@ -267,6 +521,32 @@ function SourceStep({
         Import a CSV or JSON export of your library. The wizard will help map fields,
         review rows, and optionally enrich metadata in the background.
       </p>
+
+      <div className="rounded-lg border border-zinc-200 bg-white p-4 shadow-sm">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h3 className="text-sm font-semibold text-zinc-700">Steam library (desktop)</h3>
+            <p className="text-xs text-zinc-500">
+              {steamAvailable
+                ? "Fetch owned games from your Steam account."
+                : "Save your Steam ID in Settings to enable this option."}
+            </p>
+          </div>
+          <button
+            type="button"
+            className="btn"
+            onClick={onImportSteam}
+            disabled={!steamAvailable || steamImporting}
+            title={
+              steamAvailable
+                ? "Fetch owned games from Steam"
+                : "Desktop-only: configure Steam in Settings"
+            }
+          >
+            {steamImporting ? "Fetching..." : "Import from Steam"}
+          </button>
+        </div>
+      </div>
 
       <label className="flex flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-zinc-300 bg-zinc-50 px-6 py-8 text-center hover:border-zinc-400">
         <span className="text-sm font-medium text-zinc-700">
@@ -441,7 +721,7 @@ function ReviewStep({
           Back
         </button>
         <button type="button" className="btn" onClick={onImport} disabled={importing}>
-          {importing ? "Importingâ€¦" : "Import rows"}
+          {importing ? "Importing..." : "Import rows"}
         </button>
       </div>
     </div>
@@ -457,7 +737,7 @@ function EnrichStep({
   snapshot,
   pause,
   resume,
-  cancel,
+  halt,
 }: {
   pendingRows: EnrichRow[];
   autoStart: boolean;
@@ -467,7 +747,7 @@ function EnrichStep({
   snapshot: RunnerSnapshot;
   pause: () => void;
   resume: () => void;
-  cancel: () => void;
+  halt: () => void;
 }) {
   const hasSession = Boolean(snapshot.sessionId);
   const rowsQueued = snapshot.queue.length;
@@ -482,6 +762,14 @@ function EnrichStep({
       onStart();
     }
   }, [autoStart, pendingRows.length, hasSession, onStart]);
+
+  const handleHalt = () => {
+    halt();
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("gt:hide-enrichment"));
+    }
+    onClose();
+  };
 
   return (
     <div className="space-y-4">
@@ -502,6 +790,11 @@ function EnrichStep({
         {hasSession && (
           <p className="text-sm text-zinc-600">
             {rowsRemaining} of {rowsQueued} rows remaining. Manage the background runner here or hide the wizard.
+          </p>
+        )}
+        {hasSession && snapshot.halted && (
+          <p className="text-xs text-amber-600">
+            Session halted. Resume here or from Settings when you are ready to finish.
           </p>
         )}
         {!hasSession && !pendingRows.length && (
@@ -530,8 +823,13 @@ function EnrichStep({
               >
                 {snapshot.paused ? "Resume" : "Pause"}
               </button>
-              <button type="button" className="btn-ghost" onClick={() => cancel()}>
-                Cancel
+              <button
+                type="button"
+                className="btn-ghost"
+                onClick={handleHalt}
+                title="Halt enrichment and resume later from Settings"
+              >
+                Halt
               </button>
             </>
           )}
@@ -721,4 +1019,3 @@ function guessFieldMap(rows: IncomingRow[]): FieldMap {
     services: find(/service/, /subscription/, /tag/),
   };
 }
-

@@ -1,3 +1,4 @@
+
 use regex::Regex;
 use reqwest::{header, StatusCode};
 use once_cell::sync::Lazy;
@@ -13,6 +14,68 @@ use std::{
   thread,
   time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+use crate::steam;
+use crate::steam::{
+  AchievementSchema, AppDetails, AppIdName, InstallInfo, NewsItem, OwnedGame, PlayerAchievements,
+  Price as SteamStorePrice, RecentGame, SteamProfile,
+};
+use crate::local_llm;
+
+#[tauri::command]
+pub fn ally_version_cmd(app: tauri::AppHandle) -> Result<String, String> {
+  crate::ally::ally_version(&app)
+}
+
+#[tauri::command]
+pub fn ally_get_data_dir(_app: tauri::AppHandle) -> Result<String, String> {
+  Ok(crate::ally::ally_data_dir_path().to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub fn ally_write_export(
+  _app: tauri::AppHandle,
+  label: String,
+  filename: String,
+  contents: String,
+) -> Result<usize, String> {
+  crate::ally::ally_write_file(&label, &filename, &contents)
+}
+
+#[tauri::command]
+pub fn ally_embed_cmd(app: tauri::AppHandle, label: String) -> Result<String, String> {
+  crate::ally::ally_embed(&app, &label)
+}
+
+#[tauri::command]
+pub fn ally_start_rag_cmd(app: tauri::AppHandle, label: String) -> Result<String, String> {
+  crate::ally::ally_start_rag(&app, &label)
+}
+
+#[tauri::command]
+pub fn ally_chat_cmd(
+  app: tauri::AppHandle,
+  session: String,
+  message: String,
+  allow_web: bool,
+) -> Result<String, String> {
+  crate::ally::ally_chat(&app, &session, &message, allow_web)
+}
+
+#[tauri::command]
+pub async fn local_llm_chat_cmd(prompt: String) -> Result<String, String> {
+  local_llm::chat(&prompt).await
+}
+
+#[tauri::command]
+pub async fn local_llm_embed_cmd(texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
+  local_llm::embed(&texts).await
+}
+
+#[tauri::command]
+pub fn local_llm_detect_cmd() -> Result<crate::local_llm::DetectInfo, String> {
+  Ok(crate::local_llm::detect())
+}
 
 const HLTB_CACHE_FILE: &str = "hltb_cache.json";
 const OPENCRITIC_CACHE_FILE: &str = "opencritic_cache.json";
@@ -43,7 +106,7 @@ struct Cached {
 }
 
 #[derive(Serialize)]
-pub struct SteamPrice {
+pub struct LegacySteamPrice {
   pub price: f32,
   pub currency: String,
 }
@@ -242,32 +305,62 @@ async fn hltb_try_api(client: &reqwest::Client, title: &str) -> Result<Option<f3
     }
   });
 
+  let mut token: Option<String> = None;
+  for attempt in 0..2 {
+    let mut request = client
+      .post("https://howlongtobeat.com/api/search")
+      .header("origin", "https://howlongtobeat.com")
+      .header("referer", "https://howlongtobeat.com/")
+      .header("content-type", "application/json")
+      .json(&payload);
+    if let Some(t) = token.as_deref() {
+      request = request.header("x-csrf-token", t);
+    }
+
+    let res = request.send().await.map_err(|e| e.to_string())?;
+    if res.status() == StatusCode::FORBIDDEN && attempt == 0 {
+      token = fetch_hltb_csrf(client).await?;
+      if token.is_none() {
+        return Ok(None);
+      }
+      continue;
+    }
+
+    if !res.status().is_success() {
+      return Err(format!("HLTB HTTP {}", res.status()));
+    }
+
+    #[derive(Deserialize)]
+    struct Item {
+      #[serde(rename = "gameplayMain")]
+      gameplay_main: Option<f32>,
+    }
+    #[derive(Deserialize)]
+    struct ApiResp {
+      data: Vec<Item>,
+    }
+
+    let body: ApiResp = res.json().await.map_err(|e| e.to_string())?;
+    return Ok(body.data.get(0).and_then(|i| i.gameplay_main));
+  }
+
+  Ok(None)
+}
+
+async fn fetch_hltb_csrf(client: &reqwest::Client) -> Result<Option<String>, String> {
   let res = client
-    .post("https://howlongtobeat.com/api/search")
-    .header("origin", "https://howlongtobeat.com")
-    .header("referer", "https://howlongtobeat.com/")
-    .header("content-type", "application/json")
-    .json(&payload)
+    .get("https://howlongtobeat.com/")
+    .header("user-agent", USER_AGENT)
     .send()
     .await
     .map_err(|e| e.to_string())?;
 
   if !res.status().is_success() {
-    return Err(format!("HLTB HTTP {}", res.status()));
+    return Err(format!("HLTB bootstrap HTTP {}", res.status()));
   }
 
-  #[derive(Deserialize)]
-  struct Item {
-    #[serde(rename = "gameplayMain")]
-    gameplay_main: Option<f32>,
-  }
-  #[derive(Deserialize)]
-  struct ApiResp {
-    data: Vec<Item>,
-  }
-
-  let body: ApiResp = res.json().await.map_err(|e| e.to_string())?;
-  Ok(body.data.get(0).and_then(|i| i.gameplay_main))
+  let text = res.text().await.map_err(|e| e.to_string())?;
+  Ok(csrf_regex().captures(&text).map(|caps| caps[1].to_string()))
 }
 
 async fn hltb_try_html(client: &reqwest::Client, title: &str) -> Result<Option<f32>, String> {
@@ -303,6 +396,11 @@ async fn hltb_try_html(client: &reqwest::Client, title: &str) -> Result<Option<f
   }
 
   Ok(None)
+}
+
+fn csrf_regex() -> &'static Regex {
+  static RE: OnceLock<Regex> = OnceLock::new();
+  RE.get_or_init(|| Regex::new(r#"csrfToken":"([^"]+)""#).unwrap())
 }
 
 fn html_main_regex() -> &'static Regex {
@@ -342,6 +440,7 @@ pub async fn hltb_search(title: String) -> Result<HLTBMeta, String> {
   }
 
   let client = reqwest::Client::builder()
+    .cookie_store(true)
     .user_agent(USER_AGENT)
     .build()
     .map_err(|e| e.to_string())?;
@@ -389,7 +488,7 @@ pub fn hltb_clear_cache() -> Result<(), String> {
 pub async fn get_steam_price_try(
   appid: u32,
   region: Option<String>,
-) -> Result<Option<SteamPrice>, String> {
+) -> Result<Option<LegacySteamPrice>, String> {
   let cc = region
     .as_deref()
     .unwrap_or(DEFAULT_STEAM_REGION)
@@ -426,7 +525,7 @@ pub async fn get_steam_price_try(
         if let Some(po) = data.price_overview {
           let price = po.final_price as f32 / 100.0;
           let currency = po.currency.to_uppercase();
-          return Ok(Some(SteamPrice { price, currency }));
+          return Ok(Some(LegacySteamPrice { price, currency }));
         }
       }
     }
@@ -550,7 +649,7 @@ pub fn get_opencritic_score(title: String) -> Result<Option<f32>, String> {
       if s > best_score { best_score = s; best_idx = i; }
     }
   }
-  let threshold_high = 0.92f64;
+  let _threshold_high = 0.92f64;
   let threshold_ok = 0.85f64;
   if best_score < threshold_ok {
     if debug { eprintln!("DEBUG_OC: FUZZY_LOW score={:.3} for '{}'", best_score, trimmed); }
@@ -584,17 +683,102 @@ pub fn get_opencritic_score(title: String) -> Result<Option<f32>, String> {
       },
     );
     write_cache(&cache_path, &cache);
-    Ok(Some(value))
-  } else {
-    cache.insert(
-      cache_key,
-      Cached { score: None, cached_at: now_unix() }
-    );
-    write_cache(&cache_path, &cache);
-    Ok(None)
+    return Ok(Some(value));
+  }
+
+  cache.insert(
+    cache_key,
+    Cached {
+      score: None,
+      cached_at: now_unix(),
+    },
+  );
+  write_cache(&cache_path, &cache);
+  Ok(None)
+}
+#[tauri::command]
+pub fn steam_resolve_vanity(vanity: String) -> Result<String, String> {
+  let trimmed = vanity.trim();
+  if trimmed.is_empty() {
+    return Err("Vanity URL cannot be empty".into());
+  }
+  steam::resolve_vanity(trimmed).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn steam_get_profile(steamid: String) -> Result<SteamProfile, String> {
+  let trimmed = steamid.trim();
+  if trimmed.is_empty() {
+    return Err("SteamID cannot be empty".into());
+  }
+  steam::get_profile(trimmed).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn steam_get_owned_games(steamid: String, include_free: bool) -> Result<Vec<OwnedGame>, String> {
+  let trimmed = steamid.trim();
+  if trimmed.is_empty() {
+    return Err("SteamID cannot be empty".into());
+  }
+  steam::get_owned_games(trimmed, include_free).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn steam_get_recently_played(steamid: String) -> Result<Vec<RecentGame>, String> {
+  let trimmed = steamid.trim();
+  if trimmed.is_empty() {
+    return Err("SteamID cannot be empty".into());
+  }
+  steam::get_recently_played_games(trimmed).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn steam_get_app_details(appid: u32) -> Result<AppDetails, String> {
+  match steam::get_app_details(appid).map_err(|e| e.to_string())? {
+    Some(details) => Ok(details),
+    None => Err("App not found".into()),
   }
 }
 
+#[tauri::command]
+pub fn steam_get_price(appid: u32) -> Result<Option<SteamStorePrice>, String> {
+  steam::get_price(appid).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn steam_get_news(appid: u32, count: u8) -> Result<Vec<NewsItem>, String> {
+  let clamped = count.clamp(1, 20);
+  steam::get_news(appid, clamped).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn steam_get_current_players(appid: u32) -> Result<Option<u32>, String> {
+  steam::get_current_players(appid).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn steam_get_player_achievements(steamid: String, appid: u32) -> Result<Option<PlayerAchievements>, String> {
+  let trimmed = steamid.trim();
+  if trimmed.is_empty() {
+    return Err("SteamID cannot be empty".into());
+  }
+  steam::get_player_achievements(trimmed, appid).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn steam_get_schema_for_game(appid: u32) -> Result<Option<AchievementSchema>, String> {
+  steam::get_schema_for_game(appid).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn steam_get_applist() -> Result<Vec<AppIdName>, String> {
+  steam::get_applist().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn steam_scan_manifests() -> Result<Vec<InstallInfo>, String> {
+  steam::scan_manifests().map_err(|e| e.to_string())
+}
 // simple token-set jaccard similarity on whitespace tokens
 fn jaccard_token_set(a: &str, b: &str) -> f64 {
   use std::collections::HashSet;
@@ -604,6 +788,8 @@ fn jaccard_token_set(a: &str, b: &str) -> f64 {
   let uni = ta.union(&tb).count() as f64;
   if uni == 0.0 { 0.0 } else { inter / uni }
 }
+
+
 
 
 

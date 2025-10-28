@@ -1,4 +1,4 @@
-
+﻿
 import {
   KeyboardEvent,
   MouseEvent,
@@ -10,18 +10,31 @@ import {
   useRef,
   useState,
 } from "react";
-import { db } from "@/db";
-import ImportWizard from "@/components/ImportWizard";
+import clsx from "clsx";
+import {
+  db,
+  getLibrarySort,
+  setLibrarySort,
+  getSetting,
+  setSetting,
+  type SteamOwnedRow,
+  type SteamRecentRow,
+} from "@/db";
 import Modal from "@/components/Modal";
 import GameCover from "@/components/GameCover";
-import Drawer from "@/components/details/Drawer";
+import ReOnboarding from "@/components/ReOnboarding";
 import { DataInspector } from "@/components/DataInspector";
+import { ErrorBoundary as UIErrorBoundary } from "@/ui/ErrorBoundary";
 import { useIGDB } from "@/hooks/useIGDB";
 import { useHLTB } from "@/hooks/useHLTB";
-import { loadMCIndex, mcKey } from "@/data/metacriticIndex";
-import type { RawgGameCache } from "@/db";
+import { getMCEntry, loadMCIndex, mcKey } from "@/data/metacriticIndex";
+import type { RawgGameCache, RawgMovie, RawgScreenshot } from "@/db";
 import { ensureRawgDetail, getCachedRawgDetail } from "@/data/rawgCache";
+import { getScreenshots, getMovies } from "@/apis/rawg";
 import { isTauri, fetchOpenCriticScore, fetchSteamPrice } from "@/desktop/bridge";
+import { ensureSteamId, getOwnedGames, getRecentlyPlayed, getSteamProfile } from "@/desktop/steamBridge";
+// Inline detail expansion is used instead of a Drawer
+import { useVendorFlag } from "@/state/vendorFlags";
 
 import {
   pricePerHour,
@@ -68,6 +81,18 @@ type SortField =
   | "acquired";
 type SortDirection = "asc" | "desc";
 type CriticSourceFilter = "any" | "metacritic" | "opencritic" | "rawg" | "none";
+
+const SORT_FIELDS: SortField[] = [
+  "title",
+  "platform",
+  "status",
+  "price",
+  "ttb",
+  "pph",
+  "oc",
+  "mc",
+  "acquired",
+];
 
 const STORE_BADGE_DETAILS: Record<StoreId, StoreBadgeDetail> = {
   steam: { label: "Steam", badge: "Steam" },
@@ -140,12 +165,33 @@ function inferStore(
 const ALL = "ALL" as const;
 
 const GameDetails = lazy(() => import("../components/details/GameDetails"));
+const ImportWizard = lazy(() => import("@/components/ImportWizard"));
 
 function prefetchGameDetailsLazy(identityId: string) {
   void import("../components/details/GameDetails")
     .then((mod) => {
       if (typeof mod.prefetchGameDetails === "function") {
         mod.prefetchGameDetails(identityId);
+      }
+    })
+    .catch(() => {});
+}
+
+function invalidateGameDetailsLazy(identityId: string) {
+  void import("../components/details/GameDetails")
+    .then((mod) => {
+      if (typeof mod.invalidateGameDetails === "function") {
+        mod.invalidateGameDetails(identityId);
+      }
+    })
+    .catch(() => {});
+}
+
+function resetSteamCacheLazy(next: string | null) {
+  void import("../components/details/GameDetails")
+    .then((mod) => {
+      if (typeof mod.resetSteamUserIdCache === "function") {
+        mod.resetSteamUserIdCache(next);
       }
     })
     .catch(() => {});
@@ -177,6 +223,7 @@ function parseDateInput(raw: string): number | null {
 export default function LibraryPage() {
   const [rows, setRows] = useState<Row[]>([]);
   const [view, setView] = useState<ViewMode>("cards");
+  const [nowPlaying, setNowPlaying] = useState<{ appId: number; name?: string } | null>(null);
 
   // Filters
   const [memberFilter, setMemberFilter] = useState<string>(ALL);
@@ -211,6 +258,63 @@ export default function LibraryPage() {
 
   const { field: sortField, direction: sortDirection } = sortState;
 
+  useEffect(() => {
+    let cancelled = false;
+    getLibrarySort()
+      .then((stored) => {
+        if (!stored || cancelled) return;
+        const { field, direction } = stored;
+        if (!SORT_FIELDS.includes(field as SortField)) return;
+        if (direction !== "asc" && direction !== "desc") return;
+        setSortState((prev) => {
+          if (prev.field === field && prev.direction === direction) {
+            return prev;
+          }
+          return { field: field as SortField, direction: direction as SortDirection };
+        });
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri) return;
+    let cancelled = false;
+    let interval: number | null = null;
+
+    const loadNowPlaying = async () => {
+      try {
+        const steamId = await getSetting<string>("steam.myId");
+        if (!steamId || cancelled) {
+          if (!cancelled) setNowPlaying(null);
+          return;
+        }
+        const profile = await getSteamProfile(steamId);
+        if (cancelled) return;
+        const appId = profile.nowPlayingGameId ? Number(profile.nowPlayingGameId) : NaN;
+        if (Number.isFinite(appId) && appId > 0) {
+          setNowPlaying({ appId, name: profile.nowPlayingGameName ?? undefined });
+        } else {
+          setNowPlaying(null);
+        }
+      } catch {
+        if (!cancelled) setNowPlaying(null);
+      }
+    };
+
+    void loadNowPlaying();
+    interval = window.setInterval(loadNowPlaying, 60_000);
+
+    return () => {
+      cancelled = true;
+      if (interval) {
+        window.clearInterval(interval);
+      }
+    };
+  }, []);
+
   // data for filters
   const [members, setMembers] = useState<Member[]>([]);
   const [statuses] = useState<Status[]>([
@@ -225,7 +329,8 @@ export default function LibraryPage() {
   // Import wizard
   const [wizardOpen, setWizardOpen] = useState(false);
 
-  // Details drawer
+  const rawgEnabled = useVendorFlag("rawg");
+
   const [openId, setOpenId] = useState<string | null>(null);
 
   // Editor
@@ -261,16 +366,8 @@ export default function LibraryPage() {
     return () => window.clearTimeout(handle);
   }, [searchDraft]);
 
-  const handleOpenDetails = useCallback((identityId: string, element: HTMLElement | null) => {
-    if (!identityId) return;
-    if (element) {
-      element.focus();
-    }
-    setOpenId(identityId);
-  }, []);
-
-  const handleCloseDetails = useCallback(() => {
-    setOpenId(null);
+  const toggleDetails = useCallback((identityId: string) => {
+    setOpenId((prev) => (prev === identityId ? null : identityId));
   }, []);
 
   const loadRows = useCallback(async () => {
@@ -300,9 +397,24 @@ export default function LibraryPage() {
   }, [loadRows]);
 
   useEffect(() => {
-    const handler: EventListener = () => setWizardOpen(true);
-    window.addEventListener("gt:show-enrichment", handler);
-    return () => window.removeEventListener("gt:show-enrichment", handler);
+    const handler = () => {
+      void loadRows();
+    };
+    window.addEventListener("gt:library-reload", handler);
+    return () => {
+      window.removeEventListener("gt:library-reload", handler);
+    };
+  }, [loadRows]);
+
+  useEffect(() => {
+    const showHandler: EventListener = () => setWizardOpen(true);
+    const hideHandler: EventListener = () => setWizardOpen(false);
+    window.addEventListener("gt:show-enrichment", showHandler);
+    window.addEventListener("gt:hide-enrichment", hideHandler);
+    return () => {
+      window.removeEventListener("gt:show-enrichment", showHandler);
+      window.removeEventListener("gt:hide-enrichment", hideHandler);
+    };
   }, []);
 
   const filtered = useMemo(() => {
@@ -470,19 +582,17 @@ export default function LibraryPage() {
 
   const handleSort = useCallback((field: SortField) => {
     setSortState((prev) => {
-      if (prev.field === field) {
-        return {
-          field,
-          direction: prev.direction === "asc" ? "desc" : "asc",
-        };
-      }
-      return { field, direction: "asc" };
+      const nextDirection: SortDirection =
+        prev.field === field ? (prev.direction === "asc" ? "desc" : "asc") : "asc";
+      const next: { field: SortField; direction: SortDirection } = { field, direction: nextDirection };
+      void setLibrarySort(next);
+      return next;
     });
   }, []);
 
   const renderSortableHeader = (field: SortField, label: string, align: "left" | "right" = "left") => {
     const isActive = sortField === field;
-    const indicator = isActive ? (sortDirection === "asc" ? "▲" : "▼") : "⇅";
+    const indicator = isActive ? (sortDirection === "asc" ? "â–²" : "â–¼") : "â‡…";
     const ariaSort = isActive ? (sortDirection === "asc" ? "ascending" : "descending") : "none";
 
     return (
@@ -562,7 +672,7 @@ export default function LibraryPage() {
     if (!confirm("This will delete all local data. Continue?")) return;
     await db.transaction(
       "rw",
-      [db.members, db.accounts, db.identities, db.library, db.settings, db.rawgGames],
+      [db.members, db.accounts, db.identities, db.library, db.settings, db.rawgGames, db.sessions],
       async () => {
         await db.members.clear();
         await db.accounts.clear();
@@ -570,6 +680,7 @@ export default function LibraryPage() {
         await db.library.clear();
         await db.settings.clear();
         await db.rawgGames.clear();
+        await db.sessions.clear();
       },
     );
     localStorage.removeItem("seeded-v2");
@@ -579,6 +690,7 @@ export default function LibraryPage() {
   return (
     <>
       <div className="space-y-4">
+        <ReOnboarding />
         {/* Toolbar */}
         <div className="flex items-center gap-2">
         <select
@@ -827,7 +939,15 @@ export default function LibraryPage() {
          */
         <div className="cards-grid">
           {grouped.map((g) => (
-            <CardGroup key={g.identityId} group={g} onEdit={setEditing} onOpen={handleOpenDetails} />
+            <CardGroup
+              key={g.identityId}
+              group={g}
+              onEdit={setEditing}
+              expandedId={openId}
+              onToggle={toggleDetails}
+              nowPlayingAppId={nowPlaying?.appId ?? null}
+              rawgEnabled={rawgEnabled}
+            />
           ))}
           {grouped.length === 0 && (
             <div className="text-sm text-zinc-500">Nothing to show. Try changing filters or import.</div>
@@ -895,20 +1015,15 @@ export default function LibraryPage() {
         </div>
       )}
 
-      {openId ? (
-        <Drawer open onClose={handleCloseDetails}>
-          <Suspense fallback={<DrawerFallback />}>
-            <GameDetails identityId={openId} />
-          </Suspense>
-        </Drawer>
-      ) : null}
 
       {/* Import Wizard */}
-      <ImportWizard
-        open={wizardOpen}
-        onClose={() => setWizardOpen(false)}
-        onImported={loadRows}
-      />
+      <Suspense fallback={null}>
+        <ImportWizard
+          open={wizardOpen}
+          onClose={() => setWizardOpen(false)}
+          onImported={loadRows}
+        />
+      </Suspense>
 
       {/* Editor */}
       <Editor row={editing} onClose={() => setEditing(null)} onNotify={showToast} />
@@ -918,21 +1033,22 @@ export default function LibraryPage() {
         {toast}
       </div>
     )}
+    {/* Inline details are rendered within each card; no Drawer */}
   </>
-  );
+);
 }
 
 /** ---------- Cards (grouped by Identity) ---------- */
-function CardGroup({
-  group,
-  onEdit,
-  onOpen,
-}: {
+function CardGroup({ group, onEdit, expandedId, onToggle, nowPlayingAppId, rawgEnabled }: {
   group: { identityId: string; identity?: Identity; entries: Row[] };
   onEdit: (r: Row) => void;
-  onOpen: (identityId: string, element: HTMLElement | null) => void;
+  expandedId: string | null;
+  onToggle: (identityId: string) => void;
+  nowPlayingAppId: number | null;
+  rawgEnabled: boolean;
 }) {
   const identity = group.identity;
+  const isNowPlaying = identity?.appid != null && nowPlayingAppId === identity.appid;
   const [rawgDetail, setRawgDetail] = useState<RawgGameCache | null>(null);
   const [prefetchRawg, setPrefetchRawg] = useState(false);
   const prefetchTimer = useRef<number | null>(null);
@@ -955,7 +1071,7 @@ function CardGroup({
   }, [identity?.title]);
 
   useEffect(() => {
-    if (!prefetchRawg || !identity?.title) return;
+    if (!prefetchRawg || !identity?.title || !rawgEnabled) return;
     let cancelled = false;
     void ensureRawgDetail(identity.title).then((detail) => {
       if (!cancelled) {
@@ -965,7 +1081,7 @@ function CardGroup({
     return () => {
       cancelled = true;
     };
-  }, [prefetchRawg, identity?.title]);
+  }, [prefetchRawg, identity?.title, rawgEnabled]);
 
   useEffect(() => {
     return () => {
@@ -976,8 +1092,16 @@ function CardGroup({
     };
   }, []);
 
+  useEffect(() => {
+    if (!rawgEnabled && prefetchRawg) {
+      setPrefetchRawg(false);
+    }
+  }, [rawgEnabled, prefetchRawg]);
+
+  const isExpanded = identity?.id != null && expandedId === identity.id;
+
   const schedulePrefetch = useCallback(() => {
-    if (!identity?.id) return;
+    if (!identity?.id || !rawgEnabled) return;
     if (prefetchTimer.current) {
       window.clearTimeout(prefetchTimer.current);
     }
@@ -985,7 +1109,7 @@ function CardGroup({
       prefetchGameDetailsLazy(identity.id);
       prefetchTimer.current = null;
     }, 200);
-  }, [identity?.id]);
+  }, [identity?.id, rawgEnabled]);
 
   const cancelPrefetch = useCallback(() => {
     if (prefetchTimer.current) {
@@ -994,30 +1118,49 @@ function CardGroup({
     }
   }, []);
 
-  const handleClick = useCallback(
-    (event: MouseEvent<HTMLDivElement>) => {
-      if (!identity?.id) return;
-      cancelPrefetch();
+  const triggerToggle = useCallback(() => {
+    if (!identity?.id) return;
+    if (!isExpanded) {
+      if (rawgEnabled) {
+        setPrefetchRawg(true);
+        schedulePrefetch();
+      } else {
+        setPrefetchRawg(false);
+      }
+    }
+    onToggle(identity.id);
+  }, [identity?.id, isExpanded, onToggle, schedulePrefetch, rawgEnabled]);
+
+  const handlePrefetchHint = useCallback(() => {
+    if (!identity?.id || isExpanded) return;
+    if (rawgEnabled) {
       setPrefetchRawg(true);
       schedulePrefetch();
-      onOpen(identity.id, event.currentTarget);
+    } else {
+      setPrefetchRawg(false);
+    }
+  }, [identity?.id, isExpanded, rawgEnabled, schedulePrefetch]);
+
+  const handleHeaderClick = useCallback(
+    (event: MouseEvent<HTMLDivElement>) => {
+      event.preventDefault();
+      cancelPrefetch();
+      triggerToggle();
     },
-    [identity?.id, onOpen, cancelPrefetch, schedulePrefetch],
+    [cancelPrefetch, triggerToggle],
   );
 
-  const handleKeyDown = useCallback(
+  const handleHeaderKeyDown = useCallback(
     (event: KeyboardEvent<HTMLDivElement>) => {
-      if (!identity?.id) return;
       if (event.key === "Enter" || event.key === " ") {
         event.preventDefault();
         cancelPrefetch();
-        setPrefetchRawg(true);
-        schedulePrefetch();
-        onOpen(identity.id, event.currentTarget);
+        triggerToggle();
       }
     },
-    [identity?.id, onOpen, cancelPrefetch, schedulePrefetch],
+    [cancelPrefetch, triggerToggle],
   );
+
   const best = pickBestEntry(group.entries);
   const ttbValue = best.identity?.ttbMedianMainH ?? best.ttbMedianMainH ?? null;
   const ttbSource = best.identity?.ttbSource;
@@ -1050,10 +1193,17 @@ function CardGroup({
 
   const currencyLabel = formatCurrency(best.currencyCode);
   const genreLine = rawgDetail?.genres?.length ? rawgDetail.genres.slice(0, 3).join(", ") : null;
-  const storeLine = rawgDetail?.stores?.length ? rawgDetail.stores.slice(0, 3).map((s) => s.name).join(", ") : null;
+  const storeLine = rawgDetail?.stores?.length
+    ? rawgDetail.stores.slice(0, 3).map((s) => s.name).join(", ")
+    : null;
   const ocValue = best.identity?.ocScore ?? best.ocScore ?? null;
   const mcValue = best.identity?.mcScore ?? best.mcScore ?? null;
   const criticSource = best.identity?.criticScoreSource ?? null;
+  const appid = identity?.appid ?? null;
+  const steamStoreUrl = appid ? `https://store.steampowered.com/app/${appid}/` : null;
+  const isInstalled = Boolean(best.installed ?? best.installDir ?? best.installPath);
+  const primaryActionHref =
+    appid != null ? (isInstalled ? `steam://run/${appid}` : `steam://install/${appid}`) : null;
   const scoreInfo = (() => {
     if (mcValue != null) {
       return {
@@ -1086,98 +1236,197 @@ function CardGroup({
     return null;
   })();
 
-  return (
-    <div
-      className="card library-card focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
-      role="button"
-      tabIndex={0}
-      onMouseEnter={() => {
-        setPrefetchRawg(true);
-        schedulePrefetch();
-      }}
-      onFocus={() => {
-        setPrefetchRawg(true);
-        schedulePrefetch();
-      }}
-      onMouseLeave={cancelPrefetch}
-      onBlur={cancelPrefetch}
-      onClick={handleClick}
-      onKeyDown={handleKeyDown}
-      aria-label={`Open details for ${title}`}
-    >
-      <div className="grid grid-cols-[96px_1fr] gap-3">
-        <GameCover identity={identity} className="w-24" />
+  const metaChipClass =
+    "inline-flex items-center gap-1 rounded-full border border-zinc-200 bg-zinc-100 px-2.5 py-0.5 text-[11px] font-semibold text-zinc-600 shadow-sm";
+  const entriesLabel = group.entries.length === 1 ? "entry" : "entries";
 
-        <div>
-          <div className="flex items-center justify-between mb-1">
-            <div className="flex flex-wrap items-center gap-2 font-semibold">
-              <span className="text-base leading-tight">{title}</span>
-              {platformLabel && (
-                <span className="badge" title="Platform">
-                  {platformLabel}
-                </span>
-              )}
-              {storeBadge && (
-                <span
-                  className={`store-badge store-badge--${storeBadge.id}`}
-                  title={storeBadge.label}
-                  aria-label={`${storeBadge.label} store`}
-                >
-                  {storeBadge.badge}
-                </span>
-              )}
+  const accountLabel =
+    best.account?.label ??
+    (best.accountId && best.accountId.toLowerCase() === "steam" ? "Steam" : undefined) ??
+    (best.services?.some((svc) => svc.toLowerCase() === "steam") ? "Steam" : undefined) ??
+    "-";
+  const memberLabel =
+    best.member?.name ?? (best.memberId && best.memberId !== "everyone" ? best.memberId : "Everyone");
+  const formatPlaytime = useCallback((minutes?: number | null) => {
+    if (minutes == null || !Number.isFinite(minutes)) return null;
+    const hours = Math.round((Number(minutes) / 60) * 10) / 10;
+    return `${hours}h`;
+  }, []);
+  const totalPlaytimeLabel = formatPlaytime(best.playtimeForeverMin ?? null);
+  const recentPlaytimeLabel = formatPlaytime(best.playtimeTwoWeeksMin ?? null);
+  const lastPlayedLabel = best.lastPlayedAtISO ? new Date(best.lastPlayedAtISO).toLocaleDateString() : null;
+
+  return (
+    <article
+      className={clsx(
+        "card library-card relative overflow-hidden rounded-3xl border border-zinc-200 bg-white p-4 shadow-sm transition focus-within:ring-2 focus-within:ring-emerald-500",
+        isExpanded ? "ring-1 ring-emerald-500/40" : "hover:border-emerald-200",
+      )}
+      data-expanded={isExpanded || undefined}
+    >
+      <div
+        className="group relative grid cursor-pointer items-start gap-4 sm:grid-cols-[108px_1fr]"
+        role="button"
+        tabIndex={0}
+        aria-expanded={isExpanded}
+        onMouseEnter={handlePrefetchHint}
+        onFocus={handlePrefetchHint}
+        onMouseLeave={cancelPrefetch}
+        onBlur={cancelPrefetch}
+        onClick={handleHeaderClick}
+        onKeyDown={handleHeaderKeyDown}
+        aria-label={`Toggle details for ${title}`}
+      >
+        <div className="overflow-hidden rounded-2xl border border-white/70 bg-white shadow-md ring-1 ring-black/5 transition group-hover:ring-emerald-200">
+          <GameCover identity={identity} size="lg" className="!w-24 sm:!w-28" />
+        </div>
+
+        <div className="flex min-w-0 flex-col gap-3">
+          <div className="flex flex-wrap items-start justify-between gap-2">
+            <div className="min-w-0 space-y-1">
+              <span className="text-xs font-semibold uppercase tracking-[0.18em] text-emerald-500">
+                Library entry
+              </span>
+              <h3 className="truncate text-lg font-semibold text-zinc-900">{title}</h3>
+              {genreLine ? <p className="text-xs text-zinc-500">{genreLine}</p> : null}
             </div>
-            <div className="text-xs text-zinc-500">{group.entries.length} item(s)</div>
+            <span className="rounded-full border border-zinc-200 bg-white px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide text-zinc-400">
+              {group.entries.length} {entriesLabel}
+            </span>
           </div>
 
-          <div className="text-sm text-zinc-700 space-y-1">
-            <div className="flex flex-wrap gap-2 items-center">
-              <span className="inline-block text-xs rounded bg-zinc-100 px-2 py-0.5">
-                Status: {best.status}
+          <div className="flex flex-wrap items-center gap-2">
+            {isNowPlaying ? (
+              <span
+                className={clsx(metaChipClass, "border-none bg-emerald-600 text-white")}
+                aria-label="Currently playing on Steam"
+              >
+                Now Playing
               </span>
-              <span className="inline-block text-xs rounded bg-zinc-100 px-2 py-0.5">
-                {currencyLabel}: {best.priceTRY ?? "-"}
+            ) : null}
+            <span className={metaChipClass}>Status {best.status}</span>
+            <span className={metaChipClass}>
+              {currencyLabel} {best.priceTRY ?? "-"}
+            </span>
+            <span className={metaChipClass}>
+              {ttbSourceLabel ? `TTB ${ttbSourceLabel}` : "TTB"}{" "}
+              {ttbValue != null ? `${ttbValue}h` : "-"}
+            </span>
+            <span className={metaChipClass}>
+              {currencyLabel}/h {pph ?? "-"}
+            </span>
+            {totalPlaytimeLabel ? (
+              <span className={metaChipClass}>Playtime {totalPlaytimeLabel}</span>
+            ) : null}
+            {recentPlaytimeLabel ? (
+              <span className={metaChipClass}>Last 2w {recentPlaytimeLabel}</span>
+            ) : null}
+            {lastPlayedLabel ? <span className={metaChipClass}>Last {lastPlayedLabel}</span> : null}
+            {platformLabel ? <span className={metaChipClass}>{platformLabel}</span> : null}
+            {storeBadge ? (
+              <span
+                className={clsx(
+                  metaChipClass,
+                  `store-badge store-badge--${storeBadge.id}`,
+                  "border-none bg-emerald-600/10 text-emerald-700",
+                )}
+                title={storeBadge.label}
+                aria-label={`${storeBadge.label} store`}
+              >
+                {storeBadge.badge}
               </span>
-              <span className="inline-block text-xs rounded bg-zinc-100 px-2 py-0.5">
-                {ttbSourceLabel ? `TTB (${ttbSourceLabel})` : "TTB"}:{" "}
-                {ttbValue != null ? `${ttbValue}h` : "-"}
+            ) : null}
+            {scoreInfo ? (
+              <span
+                className={clsx(
+                  metaChipClass,
+                  "border-none text-white",
+                  scoreInfo.label === "MC"
+                    ? "bg-blue-600"
+                    : scoreInfo.label === "OC"
+                      ? "bg-emerald-600"
+                      : "bg-indigo-600",
+                )}
+                title={scoreInfo.title}
+                aria-label={scoreInfo.aria}
+              >
+                {scoreInfo.label}: {scoreInfo.value}
               </span>
-              <span className="inline-block text-xs rounded bg-zinc-100 px-2 py-0.5">
-                {currencyLabel}/h: {pph ?? "-"}
-              </span>
-              {scoreInfo ? (
-                <span
-                  className={scoreInfo.className}
-                  title={scoreInfo.title}
-                  aria-label={scoreInfo.aria}
+            ) : null}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
+            <span>Account {accountLabel}</span>
+            <span>Member {memberLabel}</span>
+            {storeLine ? <span className="truncate">Stores {storeLine}</span> : null}
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-2 pt-2">
+            <span className="text-[11px] text-zinc-400">{rawgEnabled ? "Press Enter or click to view details" : "RAWG disabled: limited media"}</span>
+            <div className="flex flex-wrap items-center gap-2">
+              {primaryActionHref ? (
+                <a
+                  href={primaryActionHref}
+                  className="btn h-8 rounded-full px-4 text-xs font-semibold"
+                  onClick={(event) => event.stopPropagation()}
                 >
-                  {scoreInfo.label}: {scoreInfo.value}
-                </span>
+                  {isInstalled ? "Play" : "Install"}
+                </a>
               ) : null}
-            </div>
-
-            {genreLine && (
-              <div className="text-xs text-zinc-500">Genres: {genreLine}</div>
-            )}
-            {storeLine && (
-              <div className="text-xs text-zinc-500">Stores: {storeLine}</div>
-            )}
-
-            <div className="text-xs text-zinc-500">
-              Account: {best.account?.label || "-"} | Member: {best.member?.name || "Everyone"}
-            </div>
-
-            <div className="pt-2">
-              <button className="btn" onClick={() => { setPrefetchRawg(true); onEdit(best); }}>
+              {steamStoreUrl ? (
+                <a
+                  href={steamStoreUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="btn-ghost h-8 rounded-full px-4 text-xs font-semibold"
+                  onClick={(event) => event.stopPropagation()}
+                >
+                  Open Store
+                </a>
+              ) : null}
+              <button
+                className="btn h-8 rounded-full px-4 text-xs font-semibold"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setPrefetchRawg(rawgEnabled);
+                  onEdit(best);
+                }}
+              >
                 Edit
               </button>
             </div>
           </div>
         </div>
       </div>
-    </div>
+
+      {isExpanded && identity?.id ? (
+        <div
+          className="mt-4 rounded-2xl border border-emerald-100 bg-white/60 p-2 sm:p-3"
+          onClick={(e) => e.stopPropagation()}
+          onMouseDown={(e) => e.stopPropagation()}
+          onPointerDown={(e) => e.stopPropagation()}
+        >
+          <UIErrorBoundary title="Game details failed">
+            <Suspense fallback={<InlineDetailsFallback />}>
+              <GameDetails identityId={identity.id} />
+            </Suspense>
+          </UIErrorBoundary>
+        </div>
+      ) : null}
+
+      <span
+        aria-hidden="true"
+        className={clsx(
+          "pointer-events-none absolute right-2 top-2 hidden text-lg text-zinc-300 transition-transform sm:block",
+          isExpanded ? "rotate-180" : "",
+        )}
+      >
+        â–¾
+      </span>
+
+    </article>
   );
-}/** ---------- Editor Modal ---------- */
+}
 function Editor({
   row,
   onClose,
@@ -1200,6 +1449,10 @@ function Editor({
   const [ocScore, setOcScore] = useState<number | null>(current?.identity?.ocScore ?? current?.ocScore ?? null);
   const [mcScore, setMcScore] = useState<number | null>(current?.identity?.mcScore ?? current?.mcScore ?? null);
   const [rawgDetail, setRawgDetail] = useState<RawgGameCache | null>(null);
+  const [rawgScreens, setRawgScreens] = useState<RawgScreenshot[]>([]);
+  const [rawgTrailer, setRawgTrailer] = useState<RawgMovie | null>(null);
+  const [rawgMediaLoading, setRawgMediaLoading] = useState(false);
+  const [selectedShot, setSelectedShot] = useState(0);
 
   const currentAppid = current?.identity?.appid ?? null;
   const [appidInput, setAppidInput] = useState<string>(currentAppid ? String(currentAppid) : "");
@@ -1208,6 +1461,7 @@ function Editor({
   const [busyPrice, setBusyPrice] = useState(false);
   const [busyOC, setBusyOC] = useState(false);
   const [busyMC, setBusyMC] = useState(false);
+  const [busySteamPersonal, setBusySteamPersonal] = useState(false);
 
   useEffect(() => {
     if (!current) return;
@@ -1240,7 +1494,71 @@ function Editor({
     };
   }, [current?.identity?.title]);
 
+  useEffect(() => {
+    if (!rawgDetail?.id) {
+      setRawgScreens([]);
+      setRawgTrailer(null);
+      setSelectedShot(0);
+      return;
+    }
+    let cancelled = false;
+    setRawgMediaLoading(true);
+    (async () => {
+      try {
+        const [screensResp, moviesResp] = await Promise.all([
+          getScreenshots(rawgDetail.id, 6).catch(() => null),
+          getMovies(rawgDetail.id).catch(() => null),
+        ]);
+        if (cancelled) return;
+        const shots: RawgScreenshot[] = Array.isArray(screensResp?.results)
+          ? screensResp.results
+              .map((shot: any, index: number) => ({
+                id: typeof shot?.id === "number" ? shot.id : index,
+                image: shot?.image ?? "",
+                width: shot?.width ?? undefined,
+                height: shot?.height ?? undefined,
+                isVideo: false,
+                thumbnail: shot?.image ?? null,
+              }))
+              .filter((shot: RawgScreenshot) => Boolean(shot.image))
+          : [];
+        setRawgScreens(shots);
+        setSelectedShot(0);
+
+        const trailerItem = Array.isArray(moviesResp?.results)
+          ? moviesResp.results.find((movie: any) => movie?.preview || movie?.data?.max)
+          : null;
+        const trailer: RawgMovie | null = trailerItem
+          ? {
+              id: trailerItem.id ?? 0,
+              name: trailerItem.name ?? "Trailer",
+              preview: trailerItem.preview ?? null,
+              data: trailerItem.data ?? {},
+            }
+          : null;
+        setRawgTrailer(trailer);
+      } catch (_err) {
+        if (!cancelled) {
+          setRawgScreens([]);
+          setRawgTrailer(null);
+        }
+      } finally {
+        if (!cancelled) setRawgMediaLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [rawgDetail?.id]);
+
   if (!open || !current) return null;
+
+  const heroShot = rawgScreens[selectedShot] ?? rawgScreens[0];
+  const heroSrc = heroShot?.image ?? rawgDetail?.backgroundImage ?? null;
+  const heroAlt =
+    heroShot?.image
+      ? `RAWG screenshot ${selectedShot + 1}`
+      : rawgDetail?.title ?? current.identity?.title ?? "Game artwork";
 
   const openCriticPref = typeof window !== "undefined" ? localStorage.getItem("oc_enabled") === "1" : false;
   const openCriticAvailable = flags.openCriticEnabled || openCriticPref;
@@ -1300,9 +1618,9 @@ function Editor({
     }
     setBusyMC(true);
     try {
-      const index = await loadMCIndex();
+      await loadMCIndex();
       const key = mcKey(title, current.identity?.platform ?? undefined, undefined);
-      const entry = index[key];
+      const entry = await getMCEntry(key);
       if (!entry?.score) {
         onNotify("Metacritic (vendor): not found.");
         return;
@@ -1317,6 +1635,108 @@ function Editor({
       onNotify(err?.message || "Metacritic vendor lookup failed.");
     } finally {
       setBusyMC(false);
+    }
+  };
+
+  const handleFetchSteamPersonal = async () => {
+    if (!isTauri) {
+      onNotify("Steam data fetch requires the desktop app.");
+      return;
+    }
+    if (!currentAppid) {
+      onNotify("Add a Steam app id before fetching personal data.");
+      return;
+    }
+    setBusySteamPersonal(true);
+    try {
+      const storedId = await getSetting<string>("steam.myId");
+      if (!storedId) {
+        onNotify("Save your Steam ID in Settings first.");
+        return;
+      }
+      const { id: normalizedId } = await ensureSteamId(storedId);
+      if (normalizedId !== storedId) {
+        await setSetting("steam.myId", normalizedId);
+      }
+      resetSteamCacheLazy(normalizedId);
+      const ownedGames = await getOwnedGames(normalizedId, true);
+      const ownedEntry = ownedGames.find((game) => game.appId === currentAppid);
+      if (!ownedEntry) {
+        onNotify("No personal Steam data found for this game (not owned or profile private).");
+        return;
+      }
+      const timestamp = new Date().toISOString();
+      const ownedRow: SteamOwnedRow = {
+        steamid: normalizedId,
+        appid: currentAppid,
+        name: ownedEntry.name,
+        playtimeForeverMin: ownedEntry.playtimeForeverMin,
+        playtimeTwoWeeksMin: ownedEntry.playtimeTwoWeeksMin ?? null,
+        lastPlayedAt: ownedEntry.lastPlayedAt ?? null,
+        hasVisibleStats: ownedEntry.hasVisibleStats,
+        iconHash: ownedEntry.iconHash ?? null,
+        logoHash: ownedEntry.logoHash ?? null,
+        playtimeWindowsMin: ownedEntry.playtimeWindowsMin ?? null,
+        playtimeMacMin: ownedEntry.playtimeMacMin ?? null,
+        playtimeLinuxMin: ownedEntry.playtimeLinuxMin ?? null,
+        contentDescriptorIds: ownedEntry.contentDescriptorIds ?? null,
+        lastFetchedISO: timestamp,
+      };
+      await db.steamOwned.put(ownedRow);
+
+      const services = new Set(current.services ?? []);
+      services.add("Steam");
+      const lastPlayedISO =
+        ownedEntry.lastPlayedAt && Number.isFinite(ownedEntry.lastPlayedAt)
+          ? new Date(ownedEntry.lastPlayedAt * 1000).toISOString()
+          : null;
+      const libraryUpdates: any = {
+        playtimeForeverMin: ownedEntry.playtimeForeverMin,
+        playtimeTwoWeeksMin: ownedEntry.playtimeTwoWeeksMin ?? null,
+        lastPlayedAtISO: lastPlayedISO,
+        services: Array.from(services),
+        source: "steam",
+      };
+      if (!current.accountId || current.accountId.toLowerCase() !== "steam") {
+        libraryUpdates.accountId = "steam";
+      }
+      if (ownedEntry.playtimeForeverMin > 0) {
+        libraryUpdates.installed = true;
+      }
+      await db.library.update(current.id, libraryUpdates);
+
+      try {
+        const recentGames = await getRecentlyPlayed(normalizedId);
+        const recentEntry = recentGames.find((game) => game.appId === currentAppid);
+        if (recentEntry) {
+          const recentRow: SteamRecentRow = {
+            steamid: normalizedId,
+            appid: currentAppid,
+            name: recentEntry.name,
+            playtimeTwoWeeksMin: recentEntry.playtimeTwoWeeksMin ?? null,
+            playtimeForeverMin: recentEntry.playtimeForeverMin ?? null,
+            lastPlayedAt: recentEntry.lastPlayedAt ?? null,
+            iconHash: recentEntry.iconHash ?? null,
+            logoHash: recentEntry.logoHash ?? null,
+            lastFetchedISO: timestamp,
+          };
+          await db.steamRecent.put(recentRow);
+        }
+      } catch (_err) {
+        // silently ignore recent fetch errors
+      }
+
+      if (current.identity?.id) {
+        invalidateGameDetailsLazy(current.identity.id);
+        prefetchGameDetailsLazy(current.identity.id);
+      }
+
+      window.dispatchEvent(new Event("gt:library-reload"));
+      onNotify("Steam playtime refreshed from your account.");
+    } catch (err: any) {
+      onNotify(err?.message || "Steam personal data fetch failed.");
+    } finally {
+      setBusySteamPersonal(false);
     }
   };
 
@@ -1481,30 +1901,88 @@ function Editor({
             />
           </div>
         </div>
-        {rawgDetail && (
-          <div className="rounded bg-zinc-100 px-3 py-2 text-xs leading-relaxed text-zinc-600">
-            <div>
-              <span className="font-medium text-zinc-700">Genres:</span> {rawgDetail.genres.length ? rawgDetail.genres.join(", ") : "—"}
-            </div>
-            {rawgDetail.stores.length ? (
+        {rawgDetail ? (
+          <div className="space-y-3 rounded-2xl border border-zinc-200 bg-white p-3 shadow-inner">
+            <div className="rounded bg-zinc-100 px-3 py-2 text-xs leading-relaxed text-zinc-600">
               <div>
-                <span className="font-medium text-zinc-700">Stores:</span> {rawgDetail.stores.map((s) => s.name).join(", ")}
+                <span className="font-medium text-zinc-700">Genres:</span>{" "}
+                {rawgDetail.genres.length ? rawgDetail.genres.join(", ") : "-"}
+              </div>
+              {rawgDetail.stores.length ? (
+                <div>
+                  <span className="font-medium text-zinc-700">Stores:</span>{" "}
+                  {rawgDetail.stores.map((s) => s.name).join(", ")}
+                </div>
+              ) : null}
+              {rawgDetail.slug ? (
+                <div>
+                  <a
+                    className="text-emerald-600 underline"
+                    href={`https://rawg.io/games/${rawgDetail.slug}`}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    View on RAWG
+                  </a>
+                </div>
+              ) : null}
+            </div>
+
+            {rawgMediaLoading ? (
+              <p className="text-xs text-zinc-500">Loading RAWG media...</p>
+            ) : null}
+
+            {heroSrc ? (
+              <div className="space-y-2">
+                <div className="relative overflow-hidden rounded-xl border border-zinc-200 bg-zinc-900/5">
+                  <div style={{ aspectRatio: "16 / 9" }}>
+                    <img src={heroSrc} alt={heroAlt} className="h-full w-full object-cover" loading="lazy" />
+                  </div>
+                  {heroShot?.width && heroShot?.height ? (
+                    <span className="absolute bottom-2 right-2 rounded-full bg-black/60 px-2 py-0.5 text-[10px] font-medium text-white">
+                      {heroShot.width}x{heroShot.height}
+                    </span>
+                  ) : null}
+                </div>
+                {rawgScreens.length > 1 ? (
+                  <div className="flex gap-2 overflow-x-auto pb-1">
+                    {rawgScreens.map((shot, index) => (
+                      <button
+                        key={`${shot.id}-${index}`}
+                        type="button"
+                        onClick={() => setSelectedShot(index)}
+                        className={clsx(
+                          "relative h-16 w-28 flex-shrink-0 overflow-hidden rounded-lg border transition",
+                          selectedShot === index ? "border-emerald-500 shadow" : "border-transparent hover:border-zinc-300",
+                        )}
+                        aria-label={`Show screenshot ${index + 1}`}
+                        aria-selected={selectedShot === index}
+                      >
+                        <img src={shot.image} alt="" className="h-full w-full object-cover" loading="lazy" />
+                        {selectedShot === index ? <span className="absolute inset-0 rounded-lg border-2 border-emerald-400/70" /> : null}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
               </div>
             ) : null}
-            {rawgDetail.slug ? (
-              <div>
-                <a
-                  className="text-emerald-600 underline"
-                  href={`https://rawg.io/games/${rawgDetail.slug}`}
-                  target="_blank"
-                  rel="noreferrer"
+
+            {rawgTrailer && (rawgTrailer.data?.max || rawgTrailer.preview) ? (
+              <div className="space-y-2">
+                <h4 className="text-xs font-semibold uppercase tracking-wide text-zinc-500">Trailer</h4>
+                <video
+                  className="w-full rounded-xl border border-zinc-200"
+                  controls
+                  poster={rawgTrailer.preview ?? undefined}
                 >
-                  View on RAWG
-                </a>
+                  {rawgTrailer.data?.max ? <source src={rawgTrailer.data.max} /> : null}
+                  {rawgTrailer.data?.["480"] ? <source src={rawgTrailer.data["480"]} /> : null}
+                  Your browser does not support embedded video.
+                </video>
               </div>
             ) : null}
           </div>
-        )}
+        ) : null}
 
         <div className="grid grid-cols-3 gap-2">
           <button
@@ -1572,11 +2050,11 @@ function Editor({
             Fetch IGDB
           </button>
 
-          <button
-            type="button"
-            className="btn"
-            disabled={!isTauri || !currentAppid || busyPrice}
-            title={
+      <button
+        type="button"
+        className="btn"
+        disabled={!isTauri || !currentAppid || busyPrice}
+        title={
               !isTauri
                 ? "Desktop-only"
                 : !currentAppid
@@ -1629,11 +2107,27 @@ function Editor({
             }}
           >
             Fetch Steam Price
-          </button>
+      </button>
 
-          <div className="grid grid-cols-[1fr_auto] gap-2">
-            <input
-              className="input"
+      <button
+        type="button"
+        className="btn col-span-2"
+        disabled={!isTauri || !currentAppid || busySteamPersonal}
+        title={
+          !isTauri
+            ? "Desktop-only"
+            : !currentAppid
+            ? "Add a Steam app id first"
+            : "Sync playtime and install flags from your Steam account"
+        }
+        onClick={handleFetchSteamPersonal}
+      >
+        {busySteamPersonal ? "Fetching Steam playtime..." : "Fetch Steam personal data"}
+      </button>
+
+      <div className="grid grid-cols-[1fr_auto] gap-2">
+        <input
+          className="input"
               placeholder="Paste Steam app URL or appid"
               value={appidInput}
               onChange={(e) => setAppidInput(e.target.value)}
@@ -1708,7 +2202,7 @@ function pickBestEntry(entries: Row[]): Row {
   })[0] || entries[0]);
 }
 
-function DrawerFallback() {
+function InlineDetailsFallback() {
   return (
     <div className="space-y-4">
       <div className="h-6 w-1/2 animate-pulse rounded bg-zinc-200" />
@@ -1720,6 +2214,7 @@ function DrawerFallback() {
     </div>
   );
 }
+
 
 
 

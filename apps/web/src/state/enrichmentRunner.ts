@@ -1,9 +1,11 @@
-﻿import { useSyncExternalStore } from "react";
 import {
   db,
   clearEnrichSession,
   getEnrichSession,
   setEnrichSession,
+  getSteamPriceRow,
+  upsertSteamPriceRow,
+  isSteamPriceStale,
   type EnrichSession,
   type EnrichRowSnapshot,
   type EnrichRowSummary,
@@ -12,8 +14,9 @@ import {
 import { fetchHLTB, fetchOpenCriticScore, fetchSteamPrice, isTauri } from "@/desktop/bridge";
 import { lookupLocalHLTB } from "@/data/localDatasets";
 import { ensureRawgDetail } from "@/data/rawgCache";
-import { loadMCIndex, mcKey, type MCEntry } from "@/data/metacriticIndex";
+import { getMCEntry, loadMCIndex, mcKey, type MCEntry } from "@/data/metacriticIndex";
 import { normalizeTitleKey } from "@/utils/normalize";
+import { useSyncExternalStore } from "react";
 import type { Identity } from "@tracker/core";
 
 const INIT_MIN_MS = 600;
@@ -42,6 +45,7 @@ export type RunnerSnapshot = {
   message?: string | null;
   isDesktop: boolean;
   phase: RunnerPhase;
+  halted: boolean;
 };
 
 type Listener = () => void;
@@ -56,6 +60,23 @@ type InternalRow = EnrichRowSnapshot & {
   };
   stage: EnrichRowStage;
 };
+
+/** Higher values win; enforces Metacritic > OpenCritic > RAWG precedence. */
+const enum CriticPriority {
+  None = 0,
+  Rawg = 1,
+  OpenCritic = 2,
+  Metacritic = 3,
+}
+
+/** Higher values win; vendor/curated TTB beats live scrape, which beats RAWG estimates. */
+const enum TtbPriority {
+  None = 0,
+  Rawg = 1,
+  HltbLive = 2,
+  Vendor = 3,
+  Manual = 4,
+}
 
 class EnrichmentRunner {
   private listeners = new Set<Listener>();
@@ -74,6 +95,8 @@ class EnrichmentRunner {
   private phase: RunnerPhase = "idle";
   private initStartedAt: number | null = null;
   private pendingActiveTimer: ReturnType<typeof setTimeout> | null = null;
+  private touchedIdentityIds = new Set<string>();
+  private halted = false;
   // Simple client-side rate budgets and in-memory OC LRU
   private rateMs = { steam: 600, hltb: 900, oc: 900 } as const;
   private nextAllowedAt: Record<"steam" | "hltb" | "oc", number> = {
@@ -99,6 +122,33 @@ class EnrichmentRunner {
     }
   }
 
+  private requestActiveTransition() {
+    if (this.phase !== "init") {
+      return;
+    }
+    const startedAt = this.initStartedAt ?? Date.now();
+    this.initStartedAt = startedAt;
+    const elapsed = Date.now() - startedAt;
+    const remaining = Math.max(0, INIT_MIN_MS - elapsed);
+    if (remaining <= 0) {
+      this.phase = "active";
+      this.initStartedAt = null;
+      this.clearPendingActiveTimer();
+      return;
+    }
+    if (this.pendingActiveTimer) {
+      return;
+    }
+    this.pendingActiveTimer = setTimeout(() => {
+      this.pendingActiveTimer = null;
+      if (this.phase === "init") {
+        this.phase = "active";
+        this.initStartedAt = null;
+        this.emit();
+      }
+    }, remaining);
+  }
+
   private async ensureMCIndex() {
     if (!this.mcIndexPromise) {
       this.mcIndexPromise = loadMCIndex();
@@ -106,52 +156,20 @@ class EnrichmentRunner {
     return this.mcIndexPromise;
   }
 
-  private async finalizeIfDone() {
-    if (
-      this.sessionId &&
-      !this.queue.some((row) => row.status === "pending" || row.status === "fetching" || row.status === "paused")
-    ) {
-      this.finished = true;
-      this.message = "Enrichment finished.";
-      this.lastUpdated = Date.now();
-      this.phase = "done";
-      this.initStartedAt = null;
-      this.clearPendingActiveTimer();
-      this.emit();
-      const sessionToClear = this.sessionId;
-      this.sessionId = null;
-      await clearEnrichSession();
-      if (sessionToClear) {
-        this.emit();
-      }
-    } else {
-      this.emit();
+  private async applySteamPrice(row: InternalRow, price: number, currency: string) {
+    const normalizedPrice = Number(price);
+    if (!Number.isFinite(normalizedPrice)) return;
+    const normalizedCurrency = (currency || "").toUpperCase();
+    row.price = normalizedPrice;
+    row.currencyCode = normalizedCurrency;
+    try {
+      await db.library.update(row.id, {
+        priceTRY: normalizedPrice,
+        currencyCode: normalizedCurrency,
+      } as any);
+    } catch (_err) {
+      // Ignore Dexie write errors for price updates.
     }
-  }
-
-  private requestActiveTransition(): boolean {
-    if (this.phase !== "init") return false;
-    const now = Date.now();
-    if (this.initStartedAt == null) {
-      this.initStartedAt = now;
-    }
-    const elapsed = now - this.initStartedAt;
-    if (elapsed >= INIT_MIN_MS) {
-      this.phase = "active";
-      this.clearPendingActiveTimer();
-      return true;
-    }
-    if (!this.pendingActiveTimer) {
-      const remaining = INIT_MIN_MS - elapsed;
-      this.pendingActiveTimer = setTimeout(() => {
-        this.pendingActiveTimer = null;
-        if (this.phase === "init") {
-          this.phase = "active";
-          this.emit();
-        }
-      }, remaining);
-    }
-    return false;
   }
 
   subscribe(listener: Listener): () => void {
@@ -168,6 +186,8 @@ class EnrichmentRunner {
   async start(rows: EnrichRow[], opts?: { region?: string }) {
     if (!rows.length) return;
     this.cancel();
+    this.touchedIdentityIds.clear();
+    this.halted = false;
     if (!isTauri) {
       const now = Date.now();
       this.sessionId = null;
@@ -239,11 +259,25 @@ class EnrichmentRunner {
 
   pause() {
     if (!this.sessionId) return;
+    this.halted = false;
     this.paused = true;
-    this.message = "Pausing...";
+    this.message = "Enrichment paused.";
     this.phase = "paused";
     this.clearPendingActiveTimer();
     this.emit();
+  }
+
+  halt() {
+    if (!this.sessionId) return;
+    this.halted = true;
+    this.paused = true;
+    this.message = "Enrichment halted. Resume from Settings when you're ready.";
+    this.phase = "paused";
+    this.clearPendingActiveTimer();
+    this.emit();
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("gt:hide-enrichment"));
+    }
   }
 
   resume() {
@@ -254,6 +288,7 @@ class EnrichmentRunner {
       return;
     }
 
+    this.halted = false;
     this.paused = false;
     this.message = null;
     const hasProgress = this.queue.some(
@@ -284,8 +319,10 @@ class EnrichmentRunner {
     this.currentRowId = null;
     this.message = null;
     this.finished = false;
+    this.halted = false;
     this.queue = [];
     this.recent = [];
+    this.touchedIdentityIds.clear();
     const listeners = [...this.resumeResolvers];
     this.resumeResolvers = [];
     listeners.forEach((resolve) => resolve());
@@ -369,6 +406,43 @@ class EnrichmentRunner {
     await this.finalizeIfDone();
   }
 
+  private async finalizeIfDone() {
+    if (!this.sessionId) {
+      return;
+    }
+    if (this.finished) {
+      return;
+    }
+
+    const hasIncomplete = this.queue.some((row) => {
+      return row.status !== "done";
+    });
+    if (hasIncomplete || this.activeRowIds.size > 0) {
+      return;
+    }
+
+    this.finished = true;
+    this.paused = true;
+    this.halted = false;
+    this.phase = "done";
+    this.currentRowId = null;
+    this.lastUpdated = Date.now();
+    if (!this.message) {
+      this.message = "Enrichment complete.";
+    }
+    this.clearPendingActiveTimer();
+    this.resumeResolvers.forEach((resolve) => resolve());
+    this.resumeResolvers = [];
+    this.sessionId = null;
+    this.queue = [];
+    this.activeRowIds.clear();
+    this.processing = null;
+    this.initStartedAt = null;
+    this.touchedIdentityIds.clear();
+    void clearEnrichSession();
+    this.emit();
+  }
+
   private waitForResume() {
     if (!this.sessionId) return Promise.resolve();
     return new Promise<void>((resolve) => {
@@ -442,6 +516,14 @@ class EnrichmentRunner {
       return outcome;
     }
 
+    if (this.hasPendingVendorRows()) {
+      row.status = "pending";
+      row.updatedAt = Date.now();
+      this.deferFallbackRow(row);
+      this.emit();
+      return "done";
+    }
+
     const outcome = await this.runFallbackStage(row, identityDoc);
     if (outcome === "done") {
       this.finalizeRow(row);
@@ -455,40 +537,53 @@ class EnrichmentRunner {
     identityPlatform: string | undefined,
   ): Promise<"done" | "paused" | "fallback"> {
     if (row.appid) {
-      const steam = await this.tryWithRetries("steam", row, async () => {
-        await this.awaitBudget("steam");
-        return fetchSteamPrice(row.appid!, this.region);
-      });
-      if (steam.kind === "paused") {
-        row.status = "paused";
-        row.updatedAt = Date.now();
-        this.emit();
-        return "paused";
-      }
-      if (steam.kind === "ok") {
-        if (steam.value) {
-          const { price, currency } = steam.value;
-          row.price = price;
-          row.currencyCode = currency;
-          try {
-            await db.library.update(row.id, {
-              priceTRY: price,
-              currencyCode: currency,
-            } as any);
-          } catch (_err) {
-            // Swallow Dexie write failures; progress UI will still advance.
-          }
-        } else {
-          appendMessage(row, "Steam price: not found after retries.");
+      const cachedPrice = await getSteamPriceRow(row.appid);
+      if (cachedPrice && !isSteamPriceStale(cachedPrice)) {
+        await this.applySteamPrice(row, cachedPrice.final, cachedPrice.currency);
+      } else {
+        const steam = await this.tryWithRetries("steam", row, async () => {
+          await this.awaitBudget("steam");
+          return fetchSteamPrice(row.appid!, this.region);
+        });
+        if (steam.kind === "paused") {
+          row.status = "paused";
+          row.updatedAt = Date.now();
+          this.emit();
+          return "paused";
         }
-      } else if (steam.kind === "error") {
-        appendMessage(row, steam.message);
-      }
-      if (this.paused) {
-        row.status = "paused";
-        row.updatedAt = Date.now();
-        this.emit();
-        return "paused";
+        if (steam.kind === "ok") {
+          if (steam.value) {
+            const { price, currency } = steam.value;
+            await this.applySteamPrice(row, price, currency);
+            try {
+              await upsertSteamPriceRow({
+                appid: row.appid!,
+                currency,
+                initial: price,
+                final: price,
+                discountPercent: 0,
+                lastFetchedISO: new Date().toISOString(),
+              });
+            } catch (_err) {
+              // Ignore Dexie write failures.
+            }
+          } else {
+            appendMessage(row, "Steam price: not found after retries.");
+          }
+        } else if (steam.kind === "error") {
+          if (cachedPrice) {
+            await this.applySteamPrice(row, cachedPrice.final, cachedPrice.currency);
+            appendMessage(row, "Steam price: using cached value.");
+          } else {
+            appendMessage(row, steam.message);
+          }
+        }
+        if (this.paused) {
+          row.status = "paused";
+          row.updatedAt = Date.now();
+          this.emit();
+          return "paused";
+        }
       }
     }
 
@@ -496,9 +591,7 @@ class EnrichmentRunner {
     if (!ttbResolved) {
       try {
         const hours = await lookupLocalHLTB(row.title, identityPlatform);
-        if (hours != null) {
-          row.ttb = hours;
-          row.ttbSource = "hltb-local";
+        if (hours != null && applyTtb(row, hours, "hltb-local")) {
           try {
             await db.library.update(row.id, { ttbMedianMainH: hours } as any);
             await db.identities.update(row.identityId, {
@@ -508,12 +601,12 @@ class EnrichmentRunner {
           } catch (_err) {
             // Ignore Dexie write errors.
           }
-          ttbResolved = true;
         }
       } catch (_err) {
         console.error("HowLongToBeat lookup failed", _err);
       }
     }
+    ttbResolved = row.ttb != null && !Number.isNaN(row.ttb);
     if (!ttbResolved && this.paused) {
       row.status = "paused";
       row.updatedAt = Date.now();
@@ -529,16 +622,13 @@ class EnrichmentRunner {
 
     if (!criticResolved && row.title) {
       try {
-        const mcIndex = await this.ensureMCIndex();
+        await this.ensureMCIndex();
         const key = mcKey(row.title, identityPlatform, undefined);
-        const mc = mcIndex[key];
-        if (mc?.score != null) {
-          row.mcScore = Math.round(mc.score);
-          row.criticScoreSource = "metacritic";
-          row.ocScore = null;
-          criticResolved = true;
+        const mc = await getMCEntry(key);
+        if (mc?.score != null && applyCriticScore(row, "metacritic", mc.score)) {
+          criticResolved = row.mcScore != null && !Number.isNaN(row.mcScore);
           const updates: Partial<Identity> = {
-            mcScore: row.mcScore,
+            mcScore: row.mcScore ?? null,
             criticScoreSource: "metacritic",
             ocScore: null,
           };
@@ -549,8 +639,12 @@ class EnrichmentRunner {
               identityPlatform = mapped;
             }
           }
-          if ((!identityDoc?.mcGenres || identityDoc.mcGenres.length === 0) && mc.genres) {
-            updates.mcGenres = mc.genres.split(/,s*/).slice(0, 3);
+          if (
+            (!identityDoc?.mcGenres || identityDoc.mcGenres.length === 0) &&
+            Array.isArray(mc.genres) &&
+            mc.genres.length
+          ) {
+            updates.mcGenres = mc.genres.slice(0, 3);
           }
           try {
             await db.identities.update(row.identityId, updates as any);
@@ -598,19 +692,17 @@ class EnrichmentRunner {
       if (hltb.kind === "ok") {
         const result = hltb.value;
         const hours = result?.mainMedianHours ?? null;
-        if (hours != null) {
-          row.ttb = hours;
-          row.ttbSource = result.source;
+        const nextSource = (result?.source ?? "hltb") as Identity["ttbSource"];
+        if (hours != null && applyTtb(row, hours, nextSource)) {
           try {
             await db.library.update(row.id, { ttbMedianMainH: hours } as any);
             await db.identities.update(row.identityId, {
               ttbMedianMainH: hours,
-              ttbSource: result.source,
+              ttbSource: nextSource,
             } as any);
           } catch (_err) {
             // Ignore Dexie write errors.
           }
-          ttbResolved = true;
         } else {
           appendMessage(row, "HowLongToBeat: not found after retries.");
         }
@@ -618,13 +710,12 @@ class EnrichmentRunner {
         appendMessage(row, hltb.message);
       }
     }
+    ttbResolved = row.ttb != null && !Number.isNaN(row.ttb);
 
     if (!ttbResolved) {
       try {
         const rawg = await ensureRawgDetail(row.title);
-        if (rawg?.playtimeHours != null && rawg.playtimeHours > 0) {
-          row.ttb = rawg.playtimeHours;
-          row.ttbSource = "rawg";
+        if (rawg?.playtimeHours != null && rawg.playtimeHours > 0 && applyTtb(row, rawg.playtimeHours, "rawg")) {
           try {
             await db.library.update(row.id, { ttbMedianMainH: rawg.playtimeHours } as any);
             await db.identities.update(row.identityId, {
@@ -635,12 +726,12 @@ class EnrichmentRunner {
             // Ignore Dexie write errors.
           }
           appendMessage(row, "HowLongToBeat: estimated via RAWG playtime.");
-          ttbResolved = true;
         }
       } catch (err) {
         console.warn("RAWG playtime lookup failed", err);
       }
     }
+    ttbResolved = row.ttb != null && !Number.isNaN(row.ttb);
 
     if (!ttbResolved && !isTauri) {
       appendMessage(row, "HowLongToBeat: not available (desktop-only).");
@@ -671,13 +762,11 @@ class EnrichmentRunner {
       try {
         const rawg = await ensureRawgDetail(row.title);
         const rawgScore = rawg?.aggregatedScore ?? rawg?.metacriticScore ?? null;
-        if (rawgScore != null) {
-          row.ocScore = Math.round(rawgScore);
-          row.criticScoreSource = "rawg";
-          criticResolved = true;
+        if (rawgScore != null && applyCriticScore(row, "rawg", rawgScore)) {
           try {
             await db.identities.update(row.identityId, {
-              ocScore: row.ocScore,
+              ocScore: row.ocScore ?? undefined,
+              mcScore: row.mcScore ?? undefined,
               criticScoreSource: "rawg",
             } as any);
           } catch (_err) {
@@ -689,6 +778,9 @@ class EnrichmentRunner {
         console.warn("RAWG critic score lookup failed", err);
       }
     }
+    criticResolved =
+      (row.mcScore != null && !Number.isNaN(row.mcScore)) ||
+      (row.ocScore != null && !Number.isNaN(row.ocScore));
 
     if (!criticResolved && isTauri) {
       const oc = await this.tryWithRetries("oc", row, async () => {
@@ -712,23 +804,23 @@ class EnrichmentRunner {
         return "paused";
       }
       if (oc.kind === "ok") {
-        if (oc.value != null) {
-          row.ocScore = Math.round(oc.value);
-          row.criticScoreSource = "opencritic";
-          criticResolved = true;
+        if (oc.value != null && applyCriticScore(row, "opencritic", oc.value)) {
           try {
             await db.identities.update(row.identityId, {
-              ocScore: row.ocScore,
+              ocScore: row.ocScore ?? undefined,
+              mcScore: row.mcScore ?? undefined,
               criticScoreSource: "opencritic",
             } as any);
           } catch (_err) {
             // Ignore Dexie write errors.
           }
           const norm = normalizeTitleKey(row.title);
-          this.ocLRU.set(norm, row.ocScore);
-          if (this.ocLRU.size > this.ocLRUMax) {
-            const first = this.ocLRU.keys().next().value as string | undefined;
-            if (first) this.ocLRU.delete(first);
+          if (row.ocScore != null) {
+            this.ocLRU.set(norm, row.ocScore);
+            if (this.ocLRU.size > this.ocLRUMax) {
+              const first = this.ocLRU.keys().next().value as string | undefined;
+              if (first) this.ocLRU.delete(first);
+            }
           }
         } else {
           appendMessage(row, "OpenCritic: not found.");
@@ -739,6 +831,9 @@ class EnrichmentRunner {
     } else if (!criticResolved && !isTauri) {
       appendMessage(row, "Critic score fallback (OpenCritic) requires the desktop build.");
     }
+    criticResolved =
+      (row.mcScore != null && !Number.isNaN(row.mcScore)) ||
+      (row.ocScore != null && !Number.isNaN(row.ocScore));
 
     if (!criticResolved) {
       appendMessage(row, "Critic score not resolved after fallbacks.");
@@ -768,6 +863,7 @@ class EnrichmentRunner {
       ...this.recent,
     ].slice(0, 10);
 
+    void this.flagIdentityPartial(row);
     this.requestActiveTransition();
     this.emit();
   }
@@ -777,13 +873,33 @@ class EnrichmentRunner {
     row.status = "pending";
     row.updatedAt = Date.now();
     appendMessage(row, "Queued for fallback sources.");
+    this.moveRowToEnd(row);
+    this.requestActiveTransition();
+    this.emit();
+  }
+
+  private deferFallbackRow(row: InternalRow) {
+    row.stage = "fallback";
+    row.status = "pending";
+    row.updatedAt = Date.now();
+    this.moveRowToEnd(row);
+  }
+
+  private moveRowToEnd(row: InternalRow) {
     const idx = this.queue.indexOf(row);
     if (idx >= 0) {
       this.queue.splice(idx, 1);
       this.queue.push(row);
     }
-    this.requestActiveTransition();
-    this.emit();
+  }
+
+  private hasPendingVendorRows(): boolean {
+    return this.queue.some(
+      (candidate) =>
+        candidate.stage === "vendor" &&
+        (candidate.status === "pending" || candidate.status === "paused") &&
+        !this.activeRowIds.has(candidate.id),
+    );
   }
   private async hydrate() {
     const stored = await getEnrichSession();
@@ -804,8 +920,14 @@ class EnrichmentRunner {
       attempts: { steam: 0, hltb: 0, oc: 0 },
       stage: row.stage === "fallback" ? "fallback" : "vendor",
     }));
+    this.touchedIdentityIds = new Set(
+      stored.queue.filter((row) => row.status === "done").map((row) => row.identityId),
+    );
     this.recent = stored.recent ?? [];
-    this.message = "Ready to resume enrichment.";
+    this.halted = Boolean(stored.halted);
+    this.message = this.halted
+      ? "Enrichment halted. Resume from Settings when you're ready."
+      : "Ready to resume enrichment.";
     this.phase = stored.phase ?? (this.queue.length ? "paused" : "done");
     this.initStartedAt = null;
     this.clearPendingActiveTimer();
@@ -829,6 +951,7 @@ class EnrichmentRunner {
       message: this.message,
       isDesktop: isTauri,
       phase: this.phase,
+      halted: this.halted,
     };
   }
 
@@ -847,11 +970,49 @@ class EnrichmentRunner {
         queue: this.queue.map((row) => ({ ...row })),
         recent: [...this.recent],
         phase: this.phase,
+        halted: this.halted,
       };
       void setEnrichSession(payload);
     } else {
       void clearEnrichSession();
     }
+  }
+
+  private async flagIdentityPartial(row: InternalRow) {
+    if (!this.sessionId) return;
+    const identityId = row.identityId;
+    if (!identityId) return;
+    this.touchedIdentityIds.add(identityId);
+    const sessionRef = this.sessionId;
+    try {
+      await db.identities.update(identityId, {
+        enrichmentSessionId: sessionRef,
+        enrichmentPartial: true,
+      } as any);
+    } catch (err) {
+      console.warn("Failed to flag partially enriched identity", err);
+    }
+  }
+
+  private async resolveTouchedFlags(sessionId: string) {
+    if (!this.touchedIdentityIds.size) return;
+    const ids = Array.from(this.touchedIdentityIds);
+    try {
+      await db.transaction("rw", db.identities, async () => {
+        for (const id of ids) {
+          const identity = await db.identities.get(id);
+          if (identity?.enrichmentSessionId === sessionId) {
+            await db.identities.update(id, {
+              enrichmentSessionId: null,
+              enrichmentPartial: false,
+            } as any);
+          }
+        }
+      });
+    } catch (err) {
+      console.warn("Failed to clear enrichment flags", err);
+    }
+    this.touchedIdentityIds.clear();
   }
 
   private async tryWithRetries<T>(
@@ -906,6 +1067,76 @@ class EnrichmentRunner {
   }
 }
 
+function criticPriorityOf(source?: Identity["criticScoreSource"]): CriticPriority {
+  switch (source) {
+    case "metacritic":
+      return CriticPriority.Metacritic;
+    case "opencritic":
+      return CriticPriority.OpenCritic;
+    case "rawg":
+      return CriticPriority.Rawg;
+    default:
+      return CriticPriority.None;
+  }
+}
+
+function ttbPriorityOf(source?: Identity["ttbSource"]): TtbPriority {
+  switch (source) {
+    case "manual":
+      return TtbPriority.Manual;
+    case "hltb":
+      return TtbPriority.HltbLive;
+    case "rawg":
+      return TtbPriority.Rawg;
+    case "hltb-cache":
+    case "hltb-local":
+    case "html":
+    case "igdb":
+      return TtbPriority.Vendor;
+    default:
+      return source ? TtbPriority.Vendor : TtbPriority.None;
+  }
+}
+
+function applyCriticScore(
+  row: InternalRow,
+  source: Exclude<Identity["criticScoreSource"], undefined>,
+  value: number,
+): boolean {
+  if (value == null || Number.isNaN(value)) return false;
+  const nextPriority = criticPriorityOf(source);
+  const currentPriority = criticPriorityOf(row.criticScoreSource);
+  if (nextPriority < currentPriority) {
+    return false;
+  }
+  const rounded = Math.round(value);
+  if (source === "metacritic") {
+    row.mcScore = rounded;
+    row.ocScore = null;
+  } else {
+    row.ocScore = rounded;
+    row.mcScore = null;
+  }
+  row.criticScoreSource = source;
+  return true;
+}
+
+function applyTtb(
+  row: InternalRow,
+  hours: number,
+  source: Identity["ttbSource"],
+): boolean {
+  if (hours == null || Number.isNaN(hours)) return false;
+  const nextPriority = ttbPriorityOf(source);
+  const currentPriority = ttbPriorityOf(row.ttbSource);
+  if (nextPriority < currentPriority) {
+    return false;
+  }
+  row.ttb = hours;
+  row.ttbSource = source;
+  return true;
+}
+
 function appendMessage(row: InternalRow, text: string) {
   if (!text) return;
   row.message = row.message ? `${row.message}; ${text}` : text;
@@ -957,6 +1188,7 @@ export function useEnrichmentRunner() {
     snapshot,
     start: runner.start.bind(runner),
     pause: runner.pause.bind(runner),
+    halt: runner.halt.bind(runner),
     resume: runner.resume.bind(runner),
     cancel: runner.cancel.bind(runner),
   };
@@ -965,4 +1197,6 @@ export function useEnrichmentRunner() {
 export function getEnrichmentRunner() {
   return runner;
 }
+
+
 

@@ -1,131 +1,172 @@
 # Game Tracker - Working Log
 
 ## Project Overview
-Local-first desktop and web app to ingest personal game libraries, enrich metadata, and manage a private backlog.
+Local-first desktop and web app that ingests personal game libraries, enriches metadata, and helps manage a private backlog. Monorepo managed with PNPM.
 
-## Current State
-- Implemented: PNPM monorepo (`apps/web`, `apps/desktop`, `packages/core`), Dexie schema, import/export flows, basic metadata fetch.
-- Partial: Desktop fetch commands need reliability; styling regressions under investigation.
-- Gaps: Search/filter enhancements, store badge UX, enrichment pipeline polish.
+## Architecture Snapshot
+- Stack: React 18 + TypeScript + Vite + TailwindCSS, Dexie (IndexedDB), Tauri v2 + Rust.
+- Key modules: `apps/web/src/pages/LibraryPage.tsx`, `apps/web/src/state/enrichmentRunner.ts`, `apps/web/src/components/details/GameDetails.tsx`, `apps/desktop/src-tauri/src/commands.rs`, `packages/core/src/*`.
+- Data flow: Web UI talks to Dexie and the Tauri bridge for desktop tasks (Steam, HLTB, OpenCritic). Core package provides shared normalizers and CSV tooling.
 
-## Architecture
-- Stack: React 18 + TypeScript + Vite + TailwindCSS; Dexie (IndexedDB); Tauri v2 + Rust; PNPM workspaces.
-- Key modules/files: `apps/web/src/pages/LibraryPage.tsx`, `apps/web/src/db.ts`, `packages/core/src/*.ts`, `apps/desktop/src-tauri/src/commands.rs`.
-- Data flow: Web UI + desktop bridge (`apps/web/src/desktop/bridge.ts`) + Tauri commands + remote APIs; imports use core normalizers then Dexie persistence.
+## Current Status
+- Inline card expansion with RAWG-powered detail drawer (lazy loaded, sanitized HTML, request budgeting, memoized caches).
+- Vendor-first enrichment runner with pause/resume/halt, persistence across reloads, and source precedence (MC > OC > RAWG, HLTB vendor > live > RAWG).
+- Desktop session logger (Windows) feeding Dexie `sessions`, powering re-onboarding card and finish planner.
+- Outstanding polish: improve Explore views, configurable data-source toggles, reduce main bundle size further, expand automated tests.
 
-## Decisions & Rationale
-- Manual per-item metadata fetch with caching/backoff to respect API rate limits.
-- Fixed-width library cards (responsive column count only) for visual consistency.
-- Local caches under `%AppData%/GameTracker/` for HLTB/OpenCritic/Steam metadata.
-
-## Open Tasks
-- Now: Restore Tailwind styling, enforce fixed card layout, add title search, add store badges.
-- Next: Dexie migration for new fields, row-by-row importer enrichment with throttling.
-- Later: Ship SVG badges, explore Steam Web API integration.
-
-## Known Issues
-- UI currently unstyled due to missing Tailwind directives.
-- Desktop fetch commands may fail (OpenCritic 429, HLTB misses, Steam currency mismatches).
-- Settings page occasionally triggers "Invalid hook call".
-
-## Commands
-- Install deps: `pnpm install`
+## Command Cheatsheet
+- Install: `pnpm install`
 - Web dev: `pnpm dev:web`
-- Desktop dev: `pnpm tauri dev`
-- Core tests: `pnpm -C packages/core test`
+- Vendor index: `pnpm build:vendor`
+- Web typecheck/build: `pnpm -C apps/web typecheck` / `pnpm -C apps/web build`
+- Desktop dev: `pnpm -C apps/desktop tauri dev`
+- Desktop build sanity: `cargo check` inside `apps/desktop/src-tauri`
 
-## CSV ingestion – baseline
-- Suspected delimiter: `,`; BOM: not present; line endings: `\r
-` (Windows-style) when quoted blocks span multiple physical lines.
-- First 40 raw lines from `apps/web/public/hookdata/games.csv`:
-```
-id,metascore,platform,release_date,sort_no,summary,title,user_score
-543718,91,PC,"August 18, 2020",301,"From light planes to wide-body jets, fly highly detailed and accurate aircraft in the next generation of Microsoft Flight Simulator. Test your piloting skills against the challenges of night flying, real-time atmospheric simulation and live weather in a dynamic and living world.",Microsoft Flight Simulator,7.1
-555108,91,PC,"December 8, 2022",302,"Take up your sword, channel your magic or board your Mech. Chained Echoes is a 16-bit SNES style RPG set in a fantasy world where dragons are as common as piloted mechanical suits. Follow a group of heroes as they explore a land filled to the brim with charming characters, fantastic landscapes and vicious foes.
+## 2025-02-26 - RAWG Detail Drawer & Enrichment Improvements
+### Card Detail Drawer (RAWG-powered)
+- Component: `apps/web/src/components/details/GameDetails.tsx` (lazy loaded via `LibraryPage`).
+- Data pipeline:
+  - Dexie caches `rawgGames` with 30-day TTL for details, 7-day TTL for screenshots/movies.
+  - RAWG client (`apps/web/src/apis/rawg.ts`) enforces 1 req/sec budget with in-memory Map cache (30 min TTL) and queueing.
+  - Sanitization handled by `apps/web/src/utils/sanitizeHtml.ts` (DOMPurify with conservative allow list, `target="_blank"` links plus `rel="noopener noreferrer"`).
+- UI summary:
+  - Header shows prioritized score badge (Metacritic vendor -> OpenCritic -> RAWG) and TTB chip (HLTB vendor -> HLTB live -> RAWG average) with source labels.
+  - Tabs: Media (hero image, screenshot rail, trailers), Overview (description, genres, developers, publishers, release date, ESRB), Stores (buttons from `storeMap` mapping RAWG store IDs).
+  - Finish planner surfaces 3-5 sessions based on Dexie session median and remaining hours; collapsible detail.
+- Accessibility: Drawer is portalized with `role="dialog"`, ESC/overlay close, focus trap, restore focus to originating card. Buttons support keyboard navigation with `tabIndex`, `role="button"`, Enter/Space handlers.
 
-Can you bring peace to a continent where war has been waged for generations and betrayal lurks around every corner?
+### Enrichment Runner Enhancements
+- Dexie `settings` stores session payload (`getEnrichSession`, `setEnrichSession`), allowing resume after reload. Dexie schema bumped to v11 adding `Identity.enrichmentSessionId` and `enrichmentPartial` flags.
+- Runner enforces vendor-first pipeline (Steam price, HLTB local, Metacritic) before fallback queue (HLTB live via desktop bridge, RAWG playtime/score).
+- Rate budgets: Steam 600 ms, HLTB 900 ms, OpenCritic 900 ms between attempts; request queue resets on success/failure.
+- In-memory caches: 20 entries (5 min TTL) for quick toggling between cards; negative caching for OpenCritic to avoid repeated misses.
+- Prefetch guard: hover prefetch debounced 200 ms, single active RAWG detail per second, skip when drawer opened for same id in last 3 seconds.
 
-Chained Echoes is a story-driven game where a group of heroes travel around the vast continent of Valandis to bring an end to the war between its three kingdoms. In the course of their journey, they will travel through a wide array of diverse landscapes spanning from wind-tanned plateaus and exotic archipelagos to sunken cities and forgotten dungeons.",Chained Echoes,8.7
-106820,91,PlayStation 2,"November 7, 2005",303,"Strap on your Guitar Hero SG controller, plug-in, and CRANK IT UP. Guitar Hero creates all the sensations of being a rock star, as you rock out to 30 of the greatest rock anthems of all time and more. Soundtrack includes songs as made famous by such legendary artists as the Red Hot Chili Peppers, David Bowie, Boston, Sum 41, Ozzy Osbourne, Audioslave, White Zombie, Franz Ferdinand, and The Ramones. So kiss that air guitar goodbye and get ready to rock. Features over 30 of the greatest rock songs of all-time. 4 difficulty levels (Easy, Medium, Hard, and Expert). 6 venues that range from basement parties to sold out stadiums. 8 different characters that each offer their own look and unique style of playing, from metal head to classic rocker. Two-player mode that offers tons of multiplayer fun. [Red Octane]",Guitar Hero,8.5
-110775,91,PC,"November 13, 2008",304,"Players last visited Northrend in ""Warcraft III: The Frozen Throne,"" when Arthas Menethil fused with the spirit of NerTzhul to become the Lich King, one of the most powerful beings in the Warcraft universe. He now broods atop the Frozen Throne deep in Icecrown Citadel, clutching the rune blade Frostmourne and marshaling the undead armies of the Scourge. In Wrath of the Lich King, the forces of the Alliance and the Horde venture into battle against the Scourge amid Northrends howling winds and fields of jagged ice. Wrath of the Lich King adds a rich variety of content to an already massive game. New features in the games second expansion include: Death Knight Hero Class: Create a high-level Death Knight character -- the games first hero class -- once certain challenges have been met. Increased Level Cap: Advance to level 80 and gain potent new talents and abilities along the way. Northrend: Explore the harsh new continent of Northrend, packed with new zones, quests, dungeons, monsters, and items -- and do battle with the undead armies of the Lich King. ""Inscription"" Profession: Learn this exciting new profession and gain unique ways to permanently enhance spells and abilities in the game. Siege Weapons and Destructible Buildings: Take the battle to another level with new player-vs.-player game mechanics and new battlefields to wage war on. New Character Customization: Change how characters look and express themselves, with different hairstyles and dance animations. [Blizzard Entertainment]",World of Warcraft: Wrath of the Lich King,7.7
-142864,91,Wii,"October 26, 2010",305,Rock Band returns with the third iteration of the popular music game featuring new songs and instruments.,Rock Band 3,6.8
-114951,91,Wii,"August 24, 2009",306,"Metroid Prime 3: Corruption set a new standard for first-person motion controls in video games. Now its bringing those controls to the rest of the celebrated series, allowing players to experience the entire Metroid Prime story arc with the precision of the Wii Remote. Metroid Prime Trilogy, is a three-game collection for the Wii console that bundles all three landmark Metroid Prime games onto one disc and revamps the first two installments with intuitive Wii Remote controls, wide-screen presentation and other enhancements. Each game maintains its original storyline and settings, but now Metroid Prime and Metroid Prime 2: Echoes let players use their Wii Remote to aim with precision as heroine Samus Aran. Based on the breakthrough control system that debuted in Metroid Prime 3: Corruption, these new Wii controls bring an entirely new level of immersion and freedom to these milestone games. Players can access the game they want from a unified main menu that ties together all three adventures. Through a new unlockables system, players can gain access to in-game rewards such as music and artwork by accomplishing objectives across all three adventures. [Nintendo]",Metroid Prime Trilogy,9.2
-107055,91,PC,"June 10, 2008",307,"The E3 2007 award-winning sequel to the highest-rated real-time strategy game of all time delivers an epic campaign and fierce multiplayer battles.","Sins of a Solar Empire: Rebellion",8.8
-547914,91,PC,"February 8, 2023",308,"A farm sim game with RPG elements to it! Besides being able to farm such as growing crops or raising animals, you can also get resources from mining, fishing, logging, and interacting with NPCs by completing quests, gifting, etc. You can also decorate your garden and create routes, fences, and decorative items to personalize your garden. ???(?¬ ї??)??",Voltaire: The Vegan Vampire,6.9
-549975,91,PC,"September 28, 2022",309,"Beacon Pines is a cute and creepy adventure game. Sneak out late, make new friends, uncover hidden truths, and collect words that will change the course of fate!",Beacon Pines,8.4
-545823,91,PC,"June 14, 2022",310,"Birushana: Rising Flower of Genpei is set 15 years after the Heiji Rebellion, with the Heike clan ruling the capital, and the Minamoto clan nearly decimated. The only surviving male heir of the Minamoto clan is wrapped in secrecy and raised as a female to hide his identity, despite being the legitimate successor to the clan. Rogue elements of the Minamoto clan continue to resist the Heike, and the Heike's frustration rises to a breaking point.",Birushana: Rising Flower of Genpei,7.8
-112955,91,Wii,"October 6, 2009",311,"New Super Mario Bros. Wii is a side-scrolling platform game developed and published by Nintendo for the Wii home video game console. The sequel to New Super Mario Bros., it was released in North America on November 15, 2009, followed by Australia, Japan, and Europe a few days later. After a Wii version of Super Mario Galaxy 2, which nobody expected, Super Mario Bros. Wii was confirmed at E3 2009 on June 2, 2009. Being a sequel to New Super Mario Bros., its plot and gameplay are similar to the previous game.",New Super Mario Bros. Wii,8.9
-505011,91,PC,"September 28, 2018",312,"The culmination of the ""LEGEND OF HEROES"" series' 15th anniversary -- the total sales for which exceeded 1 million units in Asia. The Fate of the Empire will be determined in ""The Erebonian Civil War""! Presenting a new story in the Byronic ""LEGEND OF HEROES"" series, developed by the Nihon Falcom Corporation. ","The Legend of Heroes: Trails of Cold Steel IV",7.7
-492155,91,PC,"March 30, 2017",313,"A new warrior has entered the ring! Take control of the iconic Powered Rangers and their villains, past and present, in Power Rangers: Legacy Wars, a massive worldwide fighting game!Developed by nWay in collaboration with Saban Brands and Lionsgate, the multiplayer fighting game Power Rangers Legacy Wars features characters from the Power Rangers movie in addition to an entire collection of Rangers and villains from the past 24 years of the Power Rangers franchise.",Power Rangers: Legacy Wars,4.2
-514446,91,PC,"June 4, 2019",314,"A rich combination of city building, strategy and alchemy,then throw in an extra dash of random catastrophe. Make potions, break rules, and grow your massive city.",Little Big Workshop,7
-510611,91,PC,"November 20, 2018",315,"Konami's PES returns with unique football changes that'll separate it from the pack. With an improved version of the franchise's acclaimed gameplay, which has seen it win ""Best Sports Game"" at gamescom for two straight years, and industry leading visuals and presentation, PES 2019 is an experience that needs to be seen to be believed.",Pro Evolution Soccer 2019,7.3
-513295,91,PC,"August 22, 2018",316,"Enjoy the six high-quality japanese visual-novel masterpieces inside this ""all-age"" version collection with exclusive contents.",Ascension to the Throne,7.6
-113574,91,Xbox 360,"September 22, 2009",317,"The Beatles: Rock Band allows fans to pick up the guitar, bass, mic or drums and experience The Beatles’ extraordinary catalogue of music through gameplay that takes players on a journey through the legacy and evolution of the band’s legendary career.",The Beatles: Rock Band,8.5
-226948,91,PC,"August 30, 2012",318,"The Walking Dead Episode 4: Around Every Corner is the fourth of five episodes contained in Season One of The Walking Dead. The episode focuses on Lee and the remaining survivors as they finally arrive in Savannah, Georgia to escape the Walkers. The episode was written by Gary Whitta, writer of The Book of Eli and After Earth.",The Walking Dead: The Game - Episode 4: Around Every Corner,8.4
-383,91,PC,"November 16, 2004",319,"The Half-Life 2 saga is the highest acclaimed game ever with over 50 Game of the Year Awards and the highest rankings in Metacritic's PC and FPS categories. It also introduced the Source engine, the first integrated physics simulation in games. Half-Life 2: Episode One is the first in a series of episodes that reveal the aftermath of Half-Life 2 and launch a journey beyond City 17. The player reprises the role of Dr. Gordon Freeman, who along with the enigmatic Alyx Vance and her robot, Dog, was last seen leaving the heart of the Citadel before it exploded. Alyx makes an appearance as a non-player character who accompanies Gordon and fights alongside him with unique weaponry-including new additions to her arsenal. [Valve]",Half-Life 2: Episode One,9.2
-555498,91,PC,"September 21, 2022",320,"Return to Monkey Island is an unexpected, thrilling return by series creator Ron Gilbert that continues the story of the legendary adventure games The Secret of Monkey Island and Monkey Island 2: LeChuck’s Revenge developed in collaboration with Lucasfilm Games.",Return to Monkey Island,8.6
-518681,91,PC,"October 22, 2019",321,"Manifold Garden is a game that reimagines physics and space. Explore beautiful Escher-esque worlds of impossible architecture. Witness infinity through the eyes of an artist.
+### Vendor Index Refresh
+- Command: `pnpm build:vendor` (runs `scripts/build-mc-index.ts` using `scripts/csv/smartCsv.ts` parser).
+- Sniff result: delimiter `,`, BOM `false`, record delimiter `\n`.
+- Processed 20,022 CSV rows; produced 16,396 index entries (`apps/web/public/hookdata/metacritic.index.json`, size 1.22 MB).
+- Steam rows enforce rule: if `store.steampowered.com` present, title trimmed two chars before `http`; manual non-store rows skipped.
 
-Manifold Garden is a game that reimagines physics and space. Explore beautiful Escher-esque worlds of impossible architecture. Witness infinity through the eyes of an artist.",Manifold Garden,7.6
-119,91,PC,"July 19, 2000",322,"Diablo II is an action role-playing game developed by Blizzard North and published by Blizzard Entertainment in 2000 for Microsoft Windows and macOS. Diablo II was praised by critics, with many citing it as one of the greatest games of all time. It has remained popular, and also introduced the Battle.net service, which is still used today.",Diablo II,8.8
-485288,91,PC,"May 10, 2016",323,"The Witcher Card Game",Gwent: The Witcher Card Game,7.5
-486695,91,PC,"June 2, 2016",324,"Duet is a hypnotic game of time and destruction. Your survival is dependent on protecting two vessels ï¿½ they are devices in sync, a dance and song between two entities tethered together in symbiosis. Feel edge of your seat terror where the world around you becomes quiet and numb as all that matters is the game living between your palms ï¿½ that is Duet.",Duet,8.3
-562380,91,PC,"July 16, 2021",325,"Beasts of Skin, Steel, and Bone
+### Chunking
+- Vite manual chunks isolate Dexie (`vendor_db`) and DOMPurify (`vendor_html`). Lazy chunks: Settings 7.17 kB (gz 2.42), ImportWizard 15.34 kB (gz 5.38), GameDetails 46.18 kB (gz 15.76). Main bundle ~735 kB (gz 214 kB).
 
-Your expedition has gone missing, and you must find them. Thrown into a search that gets more complicated the deeper you go, can you out-think the monsters long enough to bring your companions home?
+### QA / Acceptance
+- Cards expand inline with keyboard + pointer activation; ESC collapses.
+- Drawer shows single score badge + source chips, sanitized description, tabs working with focus indicators.
+- RAWG prefetch stays within budget; repeated opens hit Dexie/in-memory cache.
+- Stores buttons open vendor URLs in new tabs (`rel="noopener"`).
+- Accessibility: Drawer announces title/description, badges have `aria-labels`, tabs use `role="tablist"` semantics.
 
-Bugsnax meets Slay the Spire in this strategy roguelike with deckbuilding elements.",Beasts of Maravilla Island,6.9
-552977,91,PC,"October 27, 2022",326,"Signalis is a classic survival horror experience set in a dystopian future where humanity has uncovered a dark secret. Unravel a cosmic mystery, escape terrifying creatures, and scavenge an off-world government facility as Elster, a technician Replika searching for her lost dreams.",Signalis,7.9
-555437,91,PC,"November 19, 2022",327,"Prodeus is the old-school shooter of today; a hand-crafted campaign from industry FPS veterans, retro visuals reinvisioned using modern rendering techniques, and gameplay that just simply feels good.
+## 2025-02-27 - Halt Flow, Session Flags, Hook Fixes
+### Enrichment Halt Workflow
+- Runner exposes `halt()`; sets `halted` flag, pauses active workers, and marks touched identities with `enrichmentPartial` until session completes.
+- UI reactions:
+  - HUD hides automatically on halt and fires `gt:hide-enrichment`. Resumes via Settings dispatch `gt:show-enrichment`; inline state tracks visibility per session id.
+  - Import Wizard closes immediately when halt pressed and warns about halted state; Settings page shows status, progress, and resume/halt buttons.
+  - Library page listens to both show/hide events to keep wizard visibility in sync.
+- Persistence: Dexie session payload includes `halted` boolean; rehydration sets message "Enrichment halted. Resume from Settings when you're ready."
 
-Old school, new school, no school. Prodeus is FPS evolved.",Prodeus,7.8
-488057,91,PC,"November 30, 2016",328,"Square Enix and tri-Ace present a brand-new RPG of cosmic proportions. Engage in real-time combat to annihilate your foes with powerful combos and switch between 6 unique characters to utilize their special strengths in battle. Discover the expansive sci-fi fantasy world of Star Ocean, meet new allies, face dangerous enemies, and save the galaxy. 2D pixel art characters are beautifully rendered against 3D environments, while real time events keep the story flowing seamlessly.",Star Ocean: First Departure R,7.6
-524604,91,PC,"February 18, 2020",329,"Mythic Ocean lets you explore the ocean depths and play a part in its reconstruction. Befriend the numerous denizens of the world as your story intertwines with theirs. Every creature you meet has their own unique life, complete with backgrounds, issues, and personality quirks of their own. Ask their opinions, invite them to hang out, introduce them to animals they’d like, or find support for their goals. Provide the gods with guidance as they respond to what the creatures value, and explore a narrative that changes drastically depending on the various choices you make.",Mythic Ocean,6.9
-108364,91,PC,"November 3, 2006",330,"Defcon is a PC strategy game inspired by the 1983 cult-classic war film ""WarGames."" The game simulates Global Thermonuclear War where the player assumes the role of a Commander hidden deep within an underground bunker. The player issues orders to armies, navies, and aircraft with the goal of causing the highest enemy civilian casualties possible, effectively rendering that territory useless to the enemy. The player that best accomplishes this goal is the winner.
+### Game Details Hook Stability
+- Fixed "Rendered more hooks than during the previous render" by computing finish-plan `useMemo` before branching on `state.status` and guarding with `data` presence. Loading/error skeletons now run without altering hook order.
 
-The game, which allows between 1 and 6 players, is inspired by the 1983 cult-classic war film ""WarGames.""",DEFCON,7.5
-554247,91,PC,"September 5, 2022",331,"The third instalment in the Danganronpa main series, Danganronpa V3: Killing Harmony introduces a new death game cast of 16 Ultimate Students.
+### Desktop Session Logger
+- Validated via `cargo check` (Windows). Foreground window polling (`GetForegroundWindow`, `GetWindowTextW`, `QueryFullProcessImageNameW`) with safe handle management and event emission via `tauri::Emitter::emit`. Sessions stored in Dexie table `sessions`.
 
-Monokuma returns to run the Killing School Semester, and Monokubs are introduced.",Danganronpa V3: Killing Harmony,7.7
-514335,91,PC,"June 26, 2019",332,"You are the unlikeliest of heroes - a rag-tag kid in an oversized suit of armour, travelling along with a goblin that's smarter than he looks, and the wind spirit that lives inside a magic sword. Together, you've got to muscle your way into the heart of an enormous, tyrannical robot and shut the thing down for good. Ravva and the Cyclops Curse is a 2D fantasy platformer inspired by classic '90s action games.",Ravva and the Cyclops Curse,7.7
-514346,91,PC,"May 8, 2019",333,"In 2054, magic has returned to a world of cold corporate technology. Vicious creatures have re-entered the world. Technology merges with flesh and mind. Elves, trolls, orks and dragons walk among us. A world in which over 20 million people use the Matrix everyday...you are one of them.","Shadowrun Returns: Dragonfall - Director's Cut",7.7
-514471,91,PC,"July 16, 2019",334,"Inspired by the classic adventure of the same name, Return of the Obra Dinn is a first-person mystery adventure based on exploration and logical deduction.
+## 2025-02-28 - Steam Integration Touch-Ups
+### Dexie + Settings
+- Bumped Dexie to v11 adding `sessions` table plus helpers (`addSessionEntry`, `updateSessionEntry`, `recentSessions`) with 400-row prune.
+- Persisted library sort and re-onboarding snooze via `getLibrarySort` / `setLibrarySort` and `getReonboardingSnooze` / `setReonboardingSnooze`.
+- Session hydrate path now restores `halted` flag and runner phase; snapshot ids carry `halted` for Settings resume flow.
 
-Lost at sea 1803--the good ship Obra Dinn.
-The next morning, the Obra Dinn drifted into port with damaged sails and no visible crew. As insurance investigator for the East India Company’s London Office, dispatch immediately to Falmouth, find means to board the ship, and prepare an assessment of damages.",Return of the Obra Dinn,8.7
-524700,91,PC,"May 21, 2020",335,"Sheepo is a pacifist ""Metroidvania"" where you traverse strange planets in order to capture and catalog species of animals. With each species you capture, you gain the ability to transform into them, unlocking new parts of the planet to explore.",Sheepo,7.5
-110179,91,PlayStation Portable,"October 6, 2009",336,"TAITO's ""Darius"" is an arcade game that was first released in 1986. This renowned side-scrolling shooting game featured a unique arcade cabinet that utilized three CRT monitors to deliver action on a super wide screen. Many players were taken aback by the overwhelming visuals that were powered by state-of-the-art pixel technology, and by the catchy ZUNTATA sound design.",Darius Burst,8.1
-510391,91,PC,"November 6, 2018",337,"Grip is a futuristic combat racing game that features breathtaking speeds and heavy weapons.",GRIP: Combat Racing,6.9
-533676,91,PC,"October 5, 2021",338,"About the ""SKIDROWCODE"" (SKIDROWCODE GAMES) is an indie company. ì�¤ë���","SKIDROWCODE GAMES",4.7
-534002,91,PC,"October 12, 2021",339,"Help the main hero cook delicious royal cuisine, manage a kitchen, run your own restaurant in a fairy country and become the best chef in the world!.","Cooking Simulator: Pizza",6.4
-513872,91,PC,"October 29, 2018",340,"""Slime Rancher"" is a first-person, sandbox adventure game released by Monomi Park in 2017 for PC, Mac, Linux, and Xbox One, and then on Nintendo Switch in 2021. The game follows the exploits of a spunky, young rancher named Beatrix LeBeau, who accepts the challenge of a new life a thousand light years away on the ""Far, Far Range."" Each day will present new challenges and risky opportunities as she attempts to amass a great fortune in the business of slime ranching. Some players have described ""Slime Rancher"" as ""Harvest Moon"" meets ""Pokemon"" with a dash of ""Animal Crossing.""",Slime Rancher,8.7
-510408,91,PC,"November 20, 2018",341,"Kenshi 2 is an upcoming video game by Lo-Fi Games.","Kenshi 2",0
-```
-- Header row: `id,metascore,platform,release_date,sort_no,summary,title,user_score`
+### Web Surface Updates
+- Library cards display a compact "Now Playing" pill when the Steam profile reports the current `gameid`.
+- Import wizard Steam step merges owned games and manifests, tracks install metadata, and stores `steam.lastSyncAt`.
+- GameDetails cleaned to ASCII, uses `computeCover` (Steam art > RAWG > IGDB), and relies on Dexie session median for finish planner hints.
 
-## Notes
-- 2025-02-14: Initialized Git, removed redundant `game-tracker/` copy, added worklog template.
-- 2025-02-14: Restored Tailwind styling/cards, added debounced title search, and surfaced store badges in library view.
-- 2025-02-14: Removed legacy `old*` web pages and re-enabled full TypeScript coverage.
-- 2025-02-14: Added Dexie v5 migration (`currencyCode`), moved TTB source tracking onto identities, and refreshed editor/bulk fetch flows.
-- 2025-02-23: Added Dexie v6 `settings` key/value store for enrichment state and introduced background enrichment with pause/resume and a floating status bar.
-- 2025-02-24: Implemented a singleton enrichment runner with persisted sessions, minimal HUD overlay, and a hideable Import Wizard. Updated `ImportWizard.tsx`, `state/enrichmentRunner.ts`, `overlays/EnrichmentHUD.tsx`, and styling/Library hooks; verified via `pnpm build` (web) â€” noted existing Vite dynamic import warning. Known limitation: Tauri bridge calls still lack abort support, so pause waits for the current request to settle.
-- 2025-02-24: Added runner `phase` lifecycle (`idle/init/active/paused/done`) with a 600ms minimum init window, shader-style init line (`gt-hud__init`) that swaps to progress fill (`gt-hud__prog`), and reduced-motion guard. `EnrichmentHUD` now reads `snapshot.phase` to switch lines while keeping popover controls unchanged.
-- 2025-02-24: Wired OpenCritic via RapidAPI: desktop command reads `OPENCRITIC_API_KEY`/`OPENCRITIC_HOST`, hits `/game/search` and `/game/{id}`, caches scores in `%AppData%/GameTracker/opencritic_cache.json` for 7 days, and backs off on 429 using `Retry-After` or a 700ms+jitter fallback.
-- 2025-02-25: **Vendor assets â€“ current:** confirmed `apps/web/public/hookdata` contains `hltb_data.csv` (70.9â€¯MB) and `games.csv` (12.7â€¯MB); both are served via `/hookdata/*` by Vite/static builds.
-- 2025-02-25: Reverted experimental HLTB Next.js integration; API endpoints still 404, parked integration.
-- 2025-02-25: IGDB integration trimmed to cover-only placeholder; removed mocked TTB updates.
-- 2025-02-25: Added Metacritic vendor pipeline (scripts/build-mc-index.ts, pps/web/src/data/metacriticIndex.ts, Dexie v8 with mcScore persistence, Library badge fallback). Latest pnpm build:vendor compiled 16,025 entries (from 20,022 rows) -> pps/web/public/hookdata/metacritic.index.json (~1.35 MB).
-- 2025-02-25: Integrated RAWG metadata (API client, Dexie cache, shared cache helpers). GameCover now falls back Steam -> RAWG -> IGDB, Library cards/Editor surface RAWG genres+stores, and Settings documents data-source precedence.
-- 2025-02-25: Rebuilt Metacritic vendor index via `build:vendor` (sniff delimiter=`,` BOM=false); processed 20,022 rows → 16,396 entries; artifact `apps/web/public/hookdata/metacritic.index.json` ≈1.22 MB.
-- 2025-02-25: Added `scripts/csv/smartCsv.ts` + `smartCsv.sanity.ts` (edgecase titles) to normalize CSV ingestion for Metacritic builds; sanity run reports pass.
-- 2025-02-25: Added Steam colon-delimited list support in importer and enabled triple-row concurrency in enrichment runner for faster processing.
+### Runner Mechanics
+- `requestActiveTransition` ensures init state lasts at least 600 ms before transitioning to `active`, with timers cleared on pause/halt.
+- `finalizeIfDone` flips sessions to `done`, clears timers, and emits a completion message once all workers stop.
+- Runner subscriptions now use `useSyncExternalStore`; halt state is persisted in Dexie payloads.
 
-## 2025-02-25: Card Detail Drawer (RAWG-powered)
-- Files: apps/web/src/pages/LibraryPage.tsx, apps/web/src/components/details/GameDetails.tsx, apps/web/src/components/details/Drawer.tsx, apps/web/src/apis/rawg.ts, apps/web/src/utils/sanitizeHtml.ts, apps/web/src/data/storeMap.ts, apps/web/src/db.ts, packages/core/src/types.ts, apps/web/package.json
-- Caching: Dexie rawgGames table now stores detail/media blobs with 30-day detail TTL and 7-day media TTL; shared in-memory LRU cache (20 entries) avoids repeat UI fetches per session
-- Sanitization: RAWG descriptions pass through DOMPurify wrapper with strict tag/attribute allowlist and forced noopener links
-- Request budget: All RAWG calls enqueue through a 1 req/sec scheduler; hover prefetch debounced 200ms and skipped if the same card opened within 3s
-- Acceptance: cards open drawer via click or Enter/Space; drawer traps focus, ESC/overlay close return focus; header shows single prioritized MC/OC/RAWG badge and TTB chip; media tab streams screenshots/trailers; stores tab opens vendor links in new tabs
-- Note: Card badge precedence remains unchanged, expanded view surfaces additional critic sources for context
+## Metrics Snapshot (2025-02-28)
+- `pnpm build:vendor`: 16,396 entries, 1.22 MB artifact (unchanged).
+- `pnpm -C apps/web typecheck`: pass.
+- `pnpm -C apps/web build`: pass; main chunk 744.00 kB (gz 216.86 kB), GameDetails chunk 54.50 kB (gz 17.88 kB), Settings chunk 11.75 kB (gz 3.64 kB). Warning noted for main bundle >500 kB.
+- `cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml`: pass (unused variable warning, `nom` future-incompat warning).
 
+## Follow-up Ideas
+- Shard Metacritic index when file exceeds 8 MB (lazy-load per letter).
+- macOS session logger via Accessibility API (needs permission gating).
+- Travel Mode profile for offline-friendly filters.
+- Settings toggles to disable vendor sources and clear caches on demand.
+
+## 2025-03-01 - Steam ID Normalization & Halt UX
+### Steam Import & Settings polish
+- Centralized Steam ID parsing in `apps/web/src/desktop/steamBridge.ts` with `ensureSteamId`, trimming vanity URLs and resolving via desktop bridge.
+- Settings page now reuses the helper, surfaces friendlier errors for missing API keys or private profiles, and keeps the saved ID normalized to SteamID64.
+- Import wizard validates the stored ID before hitting the bridge, persists the normalized ID back to Dexie, and shows actionable copy if Steam returns "player not found".
+
+### Enrichment HUD auto-hide
+- Runner `halt()` now emits `gt:hide-enrichment` so popups close no matter which surface triggers the halt.
+- Import wizard forces the HUD closed after halt, keeping resume flow gated to Settings.
+
+### Steam action shortcuts
+- Drawer header surfaces Play/Install (steam://run/install) and Open Store buttons when a Steam app id exists, preserving focus by stopping propagation.
+- Library cards mirror those controls beside the Edit button so inline expansions stay open while launching Steam.
+
+### Steam recent-play insights
+- Game details now hydrate Steam's "recently played" cache, refreshing on demand via Tauri when stale.
+- Overview tab fuses owned + recent stats to show total hours, last two weeks, and last played date even when the owned cache is missing.
+
+## 2025-03-02 - Ally Sidecar Scaffold
+### Ally sidecar smoke
+- CLI location: `apps/desktop/src-tauri/bin/ally/main.py`; Python fallback prints `ally (embedded)` via `py main.py --version`.
+- Tauri bridge executes the same entrypoint through `ally_version_cmd`; no GUI smoke in this headless session (`pnpm tauri dev` started but timed out waiting for window interaction).
+- Raw `ALLY_*` defaults captured in `.env.local`; Vite loads them via repo-root `envDir`.
+
+## 2025-03-03 - Ally Export v1
+- Shared schemas (`packages/core/src/ally/schemas.ts`) define `schemaVersion=1` payloads for library, achievements, prices, and profile JSON dumps.
+- Desktop bridge gained `ally_get_data_dir` and `ally_write_export` so the web front-end can persist JSON bundles into `%APPDATA%/GameTracker/ally-data/<label>/`.
+- Web utilities (`apps/web/src/ally/export.ts`) read from Dexie – identities + library rows for `library.json`, Steam achievements/prices caches for the others – and invoke the new Tauri writers. Empty fields stay `null`/omitted; critic/TTB fallbacks follow the existing precedence (MC>OC>RAWG, HLTB vendor>live>RAWG).
+- Settings → AI / Ally now shows the resolved data directory (desktop only) and provides a "Export data now" button, surfacing filenames + bytes written after the operation. Non-desktop builds keep the previous "requires desktop" note.
+- Nightly background export scheduled for desktop (`maybeNightlyExport`) via `requestIdleCallback`/`setTimeout` shim so the bundle stays fresh without blocking first paint. Background failures log to console only.
+- Manual smoke: headless CI can't click the button, so JSON exports weren't captured here. Local run should yield `library.json`, `achievements.json`, `prices.json`, and `profile.json` under `ally-data/my_library/`; each file begins with `{ "schemaVersion": 1, "generatedAtISO": "..." }`.
+
+## 2025-03-03 - Ally commands wired (Batch 3)
+- Added stdin-aware wrappers in `ally.rs`: `embed` (60s timeout), `start_rag` (30s), and `chat` (60s) reusing Docker/CLI/Python fallbacks. `exec_with_stdin` streams payloads and kills the process on timeout.
+- Desktop commands now expose `ally_embed_cmd`, `ally_start_rag_cmd`, and `ally_chat_cmd`; the web bridge wires `allyEmbed`, `allyStartRag`, `allyChat` alongside the existing export helpers.
+- Settings → AI / Ally gained a "Run all (Export → Embed → Start)" bootstrap plus individual buttons. Each step shows a status pill, stores its output, and persists timestamps in Dexie (`ally.lastExportISO`, `.lastEmbedISO`, `.lastStartISO`). Data dir still resolves to `%APPDATA%/GameTracker/ally-data/` via the Tauri getter.
+- Desktop-only chat smoke UI issues requests through `allyChat`, using session ids shaped like `sess_<8 hex>` and defaulting to `allowWeb = false`. Replies render as pretty JSON when possible.
+- Headless run note: the CLI/UI smoke (Run all + chat prompt) still needs manual confirmation on a desktop instance; expect the embed/start commands to report "done" and the chat prompt to return a short textual recommendation.
+- Install heuristics consider recent activity so the Play button stays available after an import-only sync.
+- Added a dedicated "Your data" section near the top of the drawer showcasing library status, price/value, and Steam play history (total, 2-week minutes, last played) for quicker scanning.
+- Library card editor gained a "Fetch Steam personal data" action so users can refresh playtime/install flags for a single game without rerunning the enrichment pipeline.
+
+### Local LLM mode + permissions + bundling (finalization)
+- Capability `event-listen` (`apps/desktop/src-tauri/capabilities/event-listen.json`) grants `core:event:default` + `core:event:allow-listen`, automatically included because the `capabilities/` folder is scanned by default.
+- Models: `models/**/*` added to bundle resources so `.gguf` files under `apps/desktop/src-tauri/models/` ship with desktop builds. Resolver also checks `exe_dir/models` and `exe_dir/resources/models` at runtime.
+- Local LLM runtime: `apps/desktop/src-tauri/src/local_llm.rs` (feature `local-llm`) discovers chat & embed models (env overrides `LLM_CHAT_MODEL_PATH`, `LLM_EMBED_MODEL_PATH`) and shells out to bundled `llama.cpp` binaries for real chat + embedding inference. Falls back to deterministic stubs only if binaries are unavailable.
+- Build glue: `apps/desktop/src-tauri/build.rs` auto-downloads prebuilt llama.cpp sidecar binaries (default tag `b3538`) for Windows/macOS/Linux at compile time unless `bin/llama/main*` already exists. Queries the GitHub release API to resolve the correct asset per platform. Override via `LLAMA_REPO`, `LLAMA_RELEASE_TAG`, or `LLAMA_SIDECAR_URL`.
+- Web UI: `apps/web/src/pages/SettingsPage.tsx` switches chat to local provider when selected and keeps Ally flow available as an alternative. One‑click bootstrap now works with Local: writes `vectors.json` and `kb.json` to Ally data dir.
+
+Acceptance checklist
+- Settings → AI / Ally shows Provider toggle (Local/Ally) and lists detected `.gguf` files (Local).
+- Run all (Export → Embed → Start) succeeds with Local provider and writes JSON under `%APPDATA%/GameTracker/ally-data/my_library/`.
+- Chat sends via Local when selected; Ally remains available for Python sidecar users.
+
+### Validation
+- `cargo check` (apps/desktop/src-tauri) — pass with existing warnings.
+- `pnpm -C apps/web typecheck` — pass.
+- `pnpm -C apps/web build` — pass (main chunk 748.71 kB gz 217.69 kB; Vite chunk-size warning acknowledged).
+
+## 2025-03-02 - HLTB session refresh & Steam editor hook
+- Desktop HLTB client now bootstraps a session (cookie store + CSRF token discovery) and retries the JSON search endpoint before falling back to HTML scraping; avoids the frequent 403s introduced by the new HowLongToBeat front-end.
+- Updated reqwest dependency to enable cookie persistence and added a lightweight regex helper for token capture.
+- Library editor's "Fetch Steam personal data" action normalizes/saves the Steam ID, refreshes owned + recent Dexie caches, invalidates the drawer cache, and automatically prefetches details so the "Your data" panel reflects new playtime immediately.
+- Helper exports `resetSteamUserIdCache`/`invalidateGameDetails` to keep drawer memoization aligned with newly fetched desktop data.
+- Overview tab follows the latest mock: critic chips now headline the detail grid and the editor shows RAWG screenshot/trailer previews with enhanced store badges so hover states feel more visual.
+- Explore page lists now hydrate from the Dexie `rawgExplore` cache, detect existing library entries, and support inline "View details" + "Add to library" actions that reuse the drawer/prefetch flow.
+- Library cards surface Steam playtime chips (total hours, last two weeks, last played date) once personal data is fetched; a `gt:library-reload` custom event keeps grids in sync after desktop syncs.
+- Drawer "Your data" card highlights library status, price/value, and Steam history ahead of the tabset so personal metrics are visible without scrolling.
+- Validation (2025-03-03): `pnpm -C apps/web typecheck` (pass), `pnpm -C apps/web build` (pass; main chunk 769.69 kB gz 223.60 kB, warning acknowledged), `cargo check` (apps/desktop/src-tauri, pass with existing warnings on `_threshold_high` and `PlayerStatsRaw.error`).
