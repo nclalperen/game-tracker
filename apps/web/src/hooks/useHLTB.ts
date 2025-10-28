@@ -1,19 +1,19 @@
-﻿import { isTauri, fetchHLTB } from "@/desktop/bridge";
+import { isTauri, fetchHLTB } from "@/desktop/bridge";
 import { lookupLocalHLTB } from "@/data/localDatasets";
+import { useVendorFlag, isVendorEnabled } from "@/state/vendorFlags";
 
 export function useHLTB() {
-  const override = typeof localStorage !== "undefined" ? localStorage.getItem("hltb_enabled") : null;
-  const enabled = override ? override === "1" : true;
+  const enabled = useVendorFlag("hltb");
 
   function cleanTitle(t: string) {
-    return t.replace(/[™®©:]/g, "").replace(/\s+/g, " ").trim();
+    return t.replace(/[Trc:]/g, "").replace(/\s+/g, " ").trim();
   }
 
   async function fetchTTB(title: string, platform?: string): Promise<{
     mainMedianHours: number | null;
     source: "hltb-local" | "hltb" | "hltb-cache" | "html" | "off";
   }> {
-    if (!enabled) {
+    if (!isVendorEnabled("hltb")) {
       return { mainMedianHours: null, source: "off" };
     }
 
@@ -44,4 +44,3 @@ export function useHLTB() {
 
   return { enabled, fetchTTB };
 }
-

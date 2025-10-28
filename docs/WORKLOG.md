@@ -1,4 +1,4 @@
-﻿# Game Tracker - Working Log
+# Game Tracker - Working Log
 
 ## Project Overview
 Local-first desktop and web app to ingest personal game libraries, enrich metadata, and manage a private backlog.
@@ -35,7 +35,8 @@ Local-first desktop and web app to ingest personal game libraries, enrich metada
 - Core tests: `pnpm -C packages/core test`
 
 ## CSV ingestion – baseline
-- Suspected delimiter: `,`; BOM: not present; line endings: `\r\n` (Windows-style) when quoted blocks span multiple physical lines.
+- Suspected delimiter: `,`; BOM: not present; line endings: `\r
+` (Windows-style) when quoted blocks span multiple physical lines.
 - First 40 raw lines from `apps/web/public/hookdata/games.csv`:
 ```
 id,metascore,platform,release_date,sort_no,summary,title,user_score
@@ -119,3 +120,12 @@ The next morning, the Obra Dinn drifted into port with damaged sails and no visi
 - 2025-02-25: Rebuilt Metacritic vendor index via `build:vendor` (sniff delimiter=`,` BOM=false); processed 20,022 rows → 16,396 entries; artifact `apps/web/public/hookdata/metacritic.index.json` ≈1.22 MB.
 - 2025-02-25: Added `scripts/csv/smartCsv.ts` + `smartCsv.sanity.ts` (edgecase titles) to normalize CSV ingestion for Metacritic builds; sanity run reports pass.
 - 2025-02-25: Added Steam colon-delimited list support in importer and enabled triple-row concurrency in enrichment runner for faster processing.
+
+## 2025-02-25: Card Detail Drawer (RAWG-powered)
+- Files: apps/web/src/pages/LibraryPage.tsx, apps/web/src/components/details/GameDetails.tsx, apps/web/src/components/details/Drawer.tsx, apps/web/src/apis/rawg.ts, apps/web/src/utils/sanitizeHtml.ts, apps/web/src/data/storeMap.ts, apps/web/src/db.ts, packages/core/src/types.ts, apps/web/package.json
+- Caching: Dexie rawgGames table now stores detail/media blobs with 30-day detail TTL and 7-day media TTL; shared in-memory LRU cache (20 entries) avoids repeat UI fetches per session
+- Sanitization: RAWG descriptions pass through DOMPurify wrapper with strict tag/attribute allowlist and forced noopener links
+- Request budget: All RAWG calls enqueue through a 1 req/sec scheduler; hover prefetch debounced 200ms and skipped if the same card opened within 3s
+- Acceptance: cards open drawer via click or Enter/Space; drawer traps focus, ESC/overlay close return focus; header shows single prioritized MC/OC/RAWG badge and TTB chip; media tab streams screenshots/trailers; stores tab opens vendor links in new tabs
+- Note: Card badge precedence remains unchanged, expanded view surfaces additional critic sources for context
+

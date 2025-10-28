@@ -1,4 +1,4 @@
-﻿import { normalizeTitle } from "@tracker/core";
+import { normalizeTitle } from "@tracker/core";
 import {
   getRawgGameByTitleKey,
   isRawgGameStale,
@@ -6,6 +6,7 @@ import {
   type RawgGameCache,
 } from "@/db";
 import { getGame, searchByTitle } from "@/apis/rawg";
+import { isVendorEnabled } from "@/state/vendorFlags";
 
 const RATE_LIMIT_MS = 1000;
 let nextAllowedAt = 0;
@@ -25,6 +26,10 @@ export async function ensureRawgDetail(title: string): Promise<RawgGameCache | n
   const cached = await getRawgGameByTitleKey(titleKey);
   if (cached && !isRawgGameStale(cached)) {
     return cached;
+  }
+
+  if (!isVendorEnabled("rawg")) {
+    return cached ?? null;
   }
 
   try {
@@ -97,6 +102,3 @@ export async function getCachedRawgDetail(title: string): Promise<RawgGameCache 
   const cached = await getRawgGameByTitleKey(titleKey);
   return cached ?? null;
 }
-
-
-

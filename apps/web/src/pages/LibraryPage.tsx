@@ -1,9 +1,20 @@
-﻿
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+import {
+  KeyboardEvent,
+  MouseEvent,
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { db } from "@/db";
 import ImportWizard from "@/components/ImportWizard";
 import Modal from "@/components/Modal";
 import GameCover from "@/components/GameCover";
+import Drawer from "@/components/details/Drawer";
 import { DataInspector } from "@/components/DataInspector";
 import { useIGDB } from "@/hooks/useIGDB";
 import { useHLTB } from "@/hooks/useHLTB";
@@ -128,6 +139,18 @@ function inferStore(
 }
 const ALL = "ALL" as const;
 
+const GameDetails = lazy(() => import("../components/details/GameDetails"));
+
+function prefetchGameDetailsLazy(identityId: string) {
+  void import("../components/details/GameDetails")
+    .then((mod) => {
+      if (typeof mod.prefetchGameDetails === "function") {
+        mod.prefetchGameDetails(identityId);
+      }
+    })
+    .catch(() => {});
+}
+
 function parseAppId(input: string): number | null {
   const s = input.trim();
   if (!s) return null;
@@ -202,6 +225,9 @@ export default function LibraryPage() {
   // Import wizard
   const [wizardOpen, setWizardOpen] = useState(false);
 
+  // Details drawer
+  const [openId, setOpenId] = useState<string | null>(null);
+
   // Editor
   const [editing, setEditing] = useState<Row | null>(null);
 
@@ -234,6 +260,18 @@ export default function LibraryPage() {
     const handle = window.setTimeout(() => setSearchText(searchDraft.trim()), 150);
     return () => window.clearTimeout(handle);
   }, [searchDraft]);
+
+  const handleOpenDetails = useCallback((identityId: string, element: HTMLElement | null) => {
+    if (!identityId) return;
+    if (element) {
+      element.focus();
+    }
+    setOpenId(identityId);
+  }, []);
+
+  const handleCloseDetails = useCallback(() => {
+    setOpenId(null);
+  }, []);
 
   const loadRows = useCallback(async () => {
     const [idents, accs, mems, libs] = await Promise.all([
@@ -785,11 +823,11 @@ export default function LibraryPage() {
          * Use a fixed-width grid for cards.  Each card has a minimum and maximum
          * width equal to the CSS custom property --card-w.  This prevents cards
          * from stretching when there is extra horizontal space and allows
-         * additional columns to appear naturally as the window grows.
+        * additional columns to appear naturally as the window grows.
          */
         <div className="cards-grid">
           {grouped.map((g) => (
-            <CardGroup key={g.identityId} group={g} onEdit={setEditing} />
+            <CardGroup key={g.identityId} group={g} onEdit={setEditing} onOpen={handleOpenDetails} />
           ))}
           {grouped.length === 0 && (
             <div className="text-sm text-zinc-500">Nothing to show. Try changing filters or import.</div>
@@ -857,6 +895,14 @@ export default function LibraryPage() {
         </div>
       )}
 
+      {openId ? (
+        <Drawer open onClose={handleCloseDetails}>
+          <Suspense fallback={<DrawerFallback />}>
+            <GameDetails identityId={openId} />
+          </Suspense>
+        </Drawer>
+      ) : null}
+
       {/* Import Wizard */}
       <ImportWizard
         open={wizardOpen}
@@ -880,13 +926,16 @@ export default function LibraryPage() {
 function CardGroup({
   group,
   onEdit,
+  onOpen,
 }: {
   group: { identityId: string; identity?: Identity; entries: Row[] };
   onEdit: (r: Row) => void;
+  onOpen: (identityId: string, element: HTMLElement | null) => void;
 }) {
   const identity = group.identity;
   const [rawgDetail, setRawgDetail] = useState<RawgGameCache | null>(null);
   const [prefetchRawg, setPrefetchRawg] = useState(false);
+  const prefetchTimer = useRef<number | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -917,6 +966,58 @@ function CardGroup({
       cancelled = true;
     };
   }, [prefetchRawg, identity?.title]);
+
+  useEffect(() => {
+    return () => {
+      if (prefetchTimer.current) {
+        window.clearTimeout(prefetchTimer.current);
+        prefetchTimer.current = null;
+      }
+    };
+  }, []);
+
+  const schedulePrefetch = useCallback(() => {
+    if (!identity?.id) return;
+    if (prefetchTimer.current) {
+      window.clearTimeout(prefetchTimer.current);
+    }
+    prefetchTimer.current = window.setTimeout(() => {
+      prefetchGameDetailsLazy(identity.id);
+      prefetchTimer.current = null;
+    }, 200);
+  }, [identity?.id]);
+
+  const cancelPrefetch = useCallback(() => {
+    if (prefetchTimer.current) {
+      window.clearTimeout(prefetchTimer.current);
+      prefetchTimer.current = null;
+    }
+  }, []);
+
+  const handleClick = useCallback(
+    (event: MouseEvent<HTMLDivElement>) => {
+      if (!identity?.id) return;
+      cancelPrefetch();
+      setPrefetchRawg(true);
+      schedulePrefetch();
+      onOpen(identity.id, event.currentTarget);
+    },
+    [identity?.id, onOpen, cancelPrefetch, schedulePrefetch],
+  );
+
+  const handleKeyDown = useCallback(
+    (event: KeyboardEvent<HTMLDivElement>) => {
+      if (!identity?.id) return;
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        cancelPrefetch();
+        setPrefetchRawg(true);
+        schedulePrefetch();
+        onOpen(identity.id, event.currentTarget);
+      }
+    },
+    [identity?.id, onOpen, cancelPrefetch, schedulePrefetch],
+  );
   const best = pickBestEntry(group.entries);
   const ttbValue = best.identity?.ttbMedianMainH ?? best.ttbMedianMainH ?? null;
   const ttbSource = best.identity?.ttbSource;
@@ -987,9 +1088,22 @@ function CardGroup({
 
   return (
     <div
-      className="card library-card"
-      onMouseEnter={() => setPrefetchRawg(true)}
-      onFocus={() => setPrefetchRawg(true)}
+      className="card library-card focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
+      role="button"
+      tabIndex={0}
+      onMouseEnter={() => {
+        setPrefetchRawg(true);
+        schedulePrefetch();
+      }}
+      onFocus={() => {
+        setPrefetchRawg(true);
+        schedulePrefetch();
+      }}
+      onMouseLeave={cancelPrefetch}
+      onBlur={cancelPrefetch}
+      onClick={handleClick}
+      onKeyDown={handleKeyDown}
+      aria-label={`Open details for ${title}`}
     >
       <div className="grid grid-cols-[96px_1fr] gap-3">
         <GameCover identity={identity} className="w-24" />
@@ -1594,18 +1708,18 @@ function pickBestEntry(entries: Row[]): Row {
   })[0] || entries[0]);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
+function DrawerFallback() {
+  return (
+    <div className="space-y-4">
+      <div className="h-6 w-1/2 animate-pulse rounded bg-zinc-200" />
+      <div className="h-48 w-full animate-pulse rounded bg-zinc-200" />
+      <div className="space-y-2">
+        <div className="h-4 w-full animate-pulse rounded bg-zinc-200" />
+        <div className="h-4 w-5/6 animate-pulse rounded bg-zinc-200" />
+      </div>
+    </div>
+  );
+}
 
 
 

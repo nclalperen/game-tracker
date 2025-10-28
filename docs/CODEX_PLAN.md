@@ -1,4 +1,4 @@
-﻿# Codex Plan
+# Codex Plan
 
 ## Completed
 - **Background enrichment runner & HUD (2025-02-24)**
@@ -20,14 +20,18 @@
 
 ## Next
 1. **HLTB live fallback refresh** - Owner: Desktop team - Target: 2025-03-05
-   - Restore token discovery + payload updates for `hltb_search`; fall back to HTML scrape when API unavailable.
-   - Runner uses vendor (Dexie) → live desktop → RAWG playtime sequence; log `ttbSource` "rawg" in cache.
-   - Manual QA: three sample titles succeed across vendor/live; retries honour throttle/backoff.
+   - Restore token discovery and payload updates for "hltb_search"; fall back to HTML scrape when API unavailable.
+   - Runner uses vendor (Dexie) -> live desktop -> RAWG playtime sequence; log ttbSource "rawg" in cache.
+   - Manual QA: three sample titles succeed across vendor/live; retries honor throttle/backoff.
 2. **RAWG gallery & media card** - Owner: Web - Target: 2025-03-08
    - Library editor/right drawer show RAWG screenshots & trailers (lazy-loaded, cached in Dexie).
    - Hover/tap reveals store logos sourced from RAWG detail with fallbacks for heuristics.
    - Ensure GameCover re-renders when new RAWG art arrives without layout shift.
 3. **Data-source toggles & cache management** - Owner: Web/Desktop - Target: 2025-03-12
    - Settings exposes switches for HLTB (desktop live) and RAWG lookups, plus "Clear RAWG cache"/"Clear MC index".
-   - Turning off vendor disables buttons/tooltips gracefully; clearing cache purges Dexie rows + HUD references.
+   - Turning off vendor disables buttons/tooltips gracefully; clearing cache purges Dexie rows and HUD references.
    - Regression: enrichment runner respects toggles; vendor fetches stop until re-enabled.
+4. **RAWG Explore pages & cache TTL split** - Owner: Web - Target: 2025-03-15
+   - Build RAWG-powered Explore views (Trending/Top/Upcoming) with lazy card grids, reuse drawer detail fetcher.
+   - Split RAWG Dexie caches: detail 30-day TTL, screenshots 7-day, movies 7-day; expose maintenance hooks.
+   - Ensure new pages respect existing request budgeting and fall back gracefully when the API key is missing.

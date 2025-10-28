@@ -14,6 +14,8 @@ export type Identity = {
   mcUserScore?: number | null;
   mcGenres?: string[];
   criticScoreSource?: "metacritic" | "opencritic" | "rawg";
+  rawgId?: number | null;
+  rawgSlug?: string | null;
 };
 
 export type LibraryItem = {
