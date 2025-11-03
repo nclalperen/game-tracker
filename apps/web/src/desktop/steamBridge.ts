@@ -125,6 +125,18 @@ export type SteamInstallInfo = {
   manifestPath?: string | null;
 };
 
+export type SteamWishlistItem = {
+  appId: number;
+  title: string;
+  addedAtISO?: string | null;
+  priority?: number | null;
+  currency?: string | null;
+  initial?: number | null;
+  final?: number | null;
+  discountPercent?: number | null;
+  saleEndISO?: string | null;
+};
+
 function ensureTauri(action: string) {
   if (!isTauri) {
     throw new Error(`Desktop-only: run the Tauri app to ${action}.`);
@@ -265,6 +277,20 @@ function mapInstall(raw: any): SteamInstallInfo {
   };
 }
 
+function mapWishlistItem(raw: any): SteamWishlistItem {
+  return {
+    appId: raw?.appid ?? 0,
+    title: raw?.title ?? raw?.name ?? "Unknown App",
+    addedAtISO: raw?.added_at_iso ?? raw?.addedAtISO ?? raw?.added_at ?? null,
+    priority: raw?.priority ?? null,
+    currency: raw?.currency ? String(raw.currency).toUpperCase() : null,
+    initial: raw?.initial ?? null,
+    final: raw?.final ?? raw?.final_price ?? null,
+    discountPercent: raw?.discount_percent ?? null,
+    saleEndISO: raw?.sale_end_iso ?? raw?.saleEndISO ?? null,
+  };
+}
+
 export function normalizeSteamIdInput(input: string): string {
   let value = input.trim();
   if (!value) return value;
@@ -394,4 +420,12 @@ export async function scanSteamManifests(): Promise<SteamInstallInfo[]> {
   ensureTauri("scan Steam manifests");
   const raw = await invoke<any[]>("steam_scan_manifests");
   return Array.isArray(raw) ? raw.map(mapInstall) : [];
+}
+
+export async function getSteamWishlist(steamId: string, cc: string, lang: string): Promise<SteamWishlistItem[]> {
+  ensureTauri("fetch Steam wishlist");
+  const region = cc.trim().toLowerCase();
+  const language = lang.trim().toLowerCase();
+  const raw = await invoke<any[]>("steam_get_wishlist", { steamid: steamId, cc: region, lang: language });
+  return Array.isArray(raw) ? raw.map(mapWishlistItem) : [];
 }

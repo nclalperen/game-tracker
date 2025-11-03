@@ -1,12 +1,15 @@
 import { isVendorEnabled } from "@/state/vendorFlags";
 
 const BASE_URL = "https://api.rawg.io/api";
-const TTL_MS = 30 * 60 * 1000; // 30 minutes
+const DEFAULT_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const LIST_TTL_MS = 60 * 60 * 1000; // 1 hour
+const SUGGESTED_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const REQUEST_INTERVAL_MS = 1000; // 1 req / sec
 const API_KEY = import.meta.env.VITE_RAWG_KEY as string | undefined;
 
 type CacheEntry<T> = { value: T; expires: number };
 
-type Bucket = "search" | "detail" | "screenshots" | "movies" | "list";
+type Bucket = "search" | "detail" | "screenshots" | "movies" | "list" | "suggested";
 
 const caches: Record<Bucket, Map<string, CacheEntry<unknown>>> = {
   search: new Map(),
@@ -14,16 +17,34 @@ const caches: Record<Bucket, Map<string, CacheEntry<unknown>>> = {
   screenshots: new Map(),
   movies: new Map(),
   list: new Map(),
+  suggested: new Map(),
 };
+
+const BUCKET_TTLS: Partial<Record<Bucket, number>> = {
+  list: LIST_TTL_MS,
+  suggested: SUGGESTED_TTL_MS,
+};
+
+let lastRequestTime = 0;
 
 function buildKey(path: string, params: URLSearchParams): string {
   return `${path}?${params.toString()}`;
+}
+
+async function applyRateLimit(): Promise<void> {
+  const now = Date.now();
+  const wait = Math.max(0, REQUEST_INTERVAL_MS - (now - lastRequestTime));
+  if (wait > 0) {
+    await new Promise((resolve) => setTimeout(resolve, wait));
+  }
+  lastRequestTime = Date.now();
 }
 
 async function fetchJson<T>(
   path: string,
   params: Record<string, string | number | boolean | undefined>,
   bucket: Bucket,
+  ttlOverrideMs?: number,
 ): Promise<T> {
   if (!isVendorEnabled("rawg")) {
     throw new Error("RAWG integration disabled in Settings.");
@@ -43,17 +64,19 @@ async function fetchJson<T>(
   const bucketCache = caches[bucket];
   const now = Date.now();
   const cached = bucketCache.get(cacheKey);
+  const ttl = ttlOverrideMs ?? BUCKET_TTLS[bucket] ?? DEFAULT_TTL_MS;
   if (cached && cached.expires > now) {
     return cached.value as T;
   }
 
   const url = `${BASE_URL}${path}?${searchParams.toString()}`;
+  await applyRateLimit();
   const resp = await fetch(url, { cache: "no-store" });
   if (!resp.ok) {
     throw new Error(`RAWG request failed (${resp.status})`);
   }
   const json = (await resp.json()) as T;
-  bucketCache.set(cacheKey, { value: json, expires: now + TTL_MS });
+  bucketCache.set(cacheKey, { value: json, expires: now + ttl });
   return json;
 }
 
@@ -84,7 +107,66 @@ export async function getMovies(id: number): Promise<any> {
 }
 
 export async function listGames(params: Record<string, string | number | boolean | undefined>): Promise<any> {
-  return fetchJson("/games", params, "list");
+  return fetchJson("/games", params, "list", LIST_TTL_MS);
+}
+
+function formatDate(date: Date): string {
+  return date.toISOString().slice(0, 10);
+}
+
+export async function listTrending(page = 1): Promise<any> {
+  const now = new Date();
+  const to = formatDate(now);
+  const from = formatDate(new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000));
+  return fetchJson(
+    "/games",
+    {
+      ordering: "-added",
+      dates: `${from},${to}`,
+      page,
+      page_size: 20,
+    },
+    "list",
+    LIST_TTL_MS,
+  );
+}
+
+export async function listUpcoming(page = 1): Promise<any> {
+  const now = new Date();
+  const from = formatDate(now);
+  const to = formatDate(new Date(now.getTime() + 180 * 24 * 60 * 60 * 1000));
+  return fetchJson(
+    "/games",
+    {
+      ordering: "-added",
+      dates: `${from},${to}`,
+      page,
+      page_size: 20,
+    },
+    "list",
+    LIST_TTL_MS,
+  );
+}
+
+export async function listNewReleases(page = 1): Promise<any> {
+  const now = new Date();
+  const to = formatDate(now);
+  const from = formatDate(new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000));
+  return fetchJson(
+    "/games",
+    {
+      ordering: "-released",
+      dates: `${from},${to}`,
+      page,
+      page_size: 20,
+    },
+    "list",
+    LIST_TTL_MS,
+  );
+}
+
+export async function getSuggested(id: number, page = 1): Promise<any> {
+  return fetchJson(`/games/${id}/suggested`, { page, page_size: 20 }, "suggested", SUGGESTED_TTL_MS);
 }
 
 export function clearRawgApiCache(): void {

@@ -1,7 +1,21 @@
-import { useState, useEffect } from "react";
-import { clearAllData, clearRawgCache, db, getSetting, replaceSteamRecentRows, setSetting } from "@/db";
+import { useState, useEffect, useCallback, lazy, Suspense } from "react";
+import {
+  clearAllData,
+  clearRawgCache,
+  clearTranscripts,
+  db,
+  getSetting,
+  replaceSteamRecentRows,
+  setSetting,
+  getAutomationSettings,
+  saveAutomationSettings,
+  getRecentAllyLogs,
+  getRecentDigests,
+  type AllyAutomationSettings,
+  type AllyLogRow,
+} from "@/db";
 import { lookupLocalHLTB } from "@/data/localDatasets";
-import { fetchSteamPrice, fetchOpenCriticScore, isTauri } from "@/desktop/bridge";
+import { fetchSteamPrice, fetchOpenCriticScore, isTauri, packDiagnostics } from "@/desktop/bridge";
 import {
   ensureSteamId,
   getSteamProfile,
@@ -11,11 +25,40 @@ import { useEnrichmentRunner } from "@/state/enrichmentRunner";
 import { useVendorFlag, setVendorFlag, type VendorKey } from "@/state/vendorFlags";
 import { resetMCIndexCache } from "@/data/metacriticIndex";
 import { clearRawgApiCache } from "@/apis/rawg";
-import { allyVersion, allyGetDataDir, allyEmbed, allyStartRag, allyChat, allyWriteExport } from "@/desktop/allyBridge";
-import { localChat, localEmbed, localDetect, type LocalDetect } from "@/desktop/localLlmBridge";
-import { exportAll } from "@/ally/export";
-import { getOrCreateSession, resetSession } from "@/ally/session";
 import { invoke } from "@tauri-apps/api/core";
+import { check } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { getVersion } from "@tauri-apps/api/app";
+import { getConsoleBufferSnapshot } from "@/utils/consoleBuffer";
+
+const AllyDigestCard = lazy(() => import("@/components/AllyDigest"));
+type LocalDetect = import("@/desktop/localLlmBridge").LocalDetect;
+
+type UpdateState = {
+  status: "idle" | "checking" | "available" | "installing" | "error" | "uptodate";
+  lastChecked: string | null;
+  version?: string | null;
+  message?: string | null;
+  automatic?: boolean;
+};
+
+type DiagnosticsState = {
+  status: "idle" | "pending" | "ready" | "error";
+  message?: string | null;
+  path?: string | null;
+};
+
+type UpdaterStatusSetting = {
+  checkedAt?: string | null;
+  available?: boolean;
+  version?: string | null;
+  error?: string | null;
+};
+
+type UpdaterEventDetail = UpdaterStatusSetting & {
+  automatic?: boolean;
+  cached?: boolean;
+};
 
 const STEAM_REGION_OPTIONS = [
   { value: "us", label: "United States" },
@@ -42,6 +85,7 @@ const STEAM_LANGUAGE_OPTIONS = [
 ];
 
 const ALLY_LABEL = "my_library" as const;
+const AI_SAVE_TRANSCRIPTS_KEY = "ally.saveTranscripts";
 type AIProvider = "local" | "ally";
 
 type StepState = {
@@ -49,6 +93,54 @@ type StepState = {
   message?: string;
   error?: string;
 };
+
+let allyBridgeModule: Promise<typeof import("@/desktop/allyBridge")> | null = null;
+function loadAllyBridge() {
+  if (!allyBridgeModule) {
+    allyBridgeModule = import("@/desktop/allyBridge");
+  }
+  return allyBridgeModule;
+}
+
+let localBridgeModule: Promise<typeof import("@/desktop/localLlmBridge")> | null = null;
+function loadLocalBridge() {
+  if (!localBridgeModule) {
+    localBridgeModule = import("@/desktop/localLlmBridge");
+  }
+  return localBridgeModule;
+}
+
+let allyExportModule: Promise<typeof import("@/ally/export")> | null = null;
+function loadAllyExport() {
+  if (!allyExportModule) {
+    allyExportModule = import("@/ally/export");
+  }
+  return allyExportModule;
+}
+
+let allySessionModule: Promise<typeof import("@/ally/session")> | null = null;
+function loadAllySession() {
+  if (!allySessionModule) {
+    allySessionModule = import("@/ally/session");
+  }
+  return allySessionModule;
+}
+
+let allyLogModule: Promise<typeof import("@/ally/log")> | null = null;
+function loadAllyLog() {
+  if (!allyLogModule) {
+    allyLogModule = import("@/ally/log");
+  }
+  return allyLogModule;
+}
+
+let allyRunbookModule: Promise<typeof import("@/ally/runbook")> | null = null;
+function loadAllyRunbook() {
+  if (!allyRunbookModule) {
+    allyRunbookModule = import("@/ally/runbook");
+  }
+  return allyRunbookModule;
+}
 
 /**
  * Settings page for Game Tracker.  This component allows users to toggle
@@ -82,6 +174,7 @@ export default function SettingsPage() {
   const [allyExportState, setAllyExportState] = useState<StepState>(() => ({ status: "idle" }));
   const [allyExportResults, setAllyExportResults] = useState<Array<{ file: string; bytes: number }>>([]);
   const [lastAllyExportISO, setLastAllyExportISO] = useState<string | null>(null);
+  const [perfLoggingEnabled, setPerfLoggingEnabled] = useState(false);
   const [aiProvider, setAiProvider] = useState<AIProvider>("local");
   const [allyEmbedState, setAllyEmbedState] = useState<StepState>(() => ({ status: "idle" }));
   const [allyStartState, setAllyStartState] = useState<StepState>(() => ({ status: "idle" }));
@@ -100,16 +193,191 @@ export default function SettingsPage() {
   const [localChatOutput, setLocalChatOutput] = useState<string | null>(null);
   const [localEmbedState, setLocalEmbedState] = useState<StepState>(() => ({ status: "idle" }));
   const [localEmbedSummary, setLocalEmbedSummary] = useState<string | null>(null);
+  const [saveTranscripts, setSaveTranscripts] = useState(true);
+  const [clearingTranscripts, setClearingTranscripts] = useState(false);
+  const [automationSettings, setAutomationSettings] = useState<AllyAutomationSettings | null>(null);
+  const [automationLoaded, setAutomationLoaded] = useState(false);
+  const [automationSaving, setAutomationSaving] = useState(false);
+  const [automationRunState, setAutomationRunState] = useState<StepState>(() => ({ status: "idle" }));
+  const [allyLogs, setAllyLogs] = useState<AllyLogRow[]>([]);
+    const [logsLoaded, setLogsLoaded] = useState(false);
+    const [logsError, setLogsError] = useState<string | null>(null);
+    const [logsExpanded, setLogsExpanded] = useState(false);
+    const [showAdvanced, setShowAdvanced] = useState(false);
+    const [updateState, setUpdateState] = useState<UpdateState>({ status: "idle", lastChecked: null });
+    const [diagnosticsState, setDiagnosticsState] = useState<DiagnosticsState>({ status: "idle" });
 
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
+  const refreshAutomation = useCallback(async () => {
+    if (!isTauri) {
+      setAutomationSettings(null);
+      setAutomationLoaded(true);
+      return;
+    }
+    setAutomationLoaded(false);
+    try {
+      const settings = await getAutomationSettings();
+      setAutomationSettings(settings);
+    } catch (err) {
+      setAutomationSettings(null);
+      throw err;
+    } finally {
+      setAutomationLoaded(true);
+    }
+  }, []);
+
+    const refreshLogs = useCallback(async () => {
+      if (!isTauri) {
+        setAllyLogs([]);
+        setLogsLoaded(true);
+        setLogsError(null);
+      return;
+    }
+    setLogsLoaded(false);
+    try {
+      const { getLogs: getAllyLogs } = await loadAllyLog();
+      const rows = await getAllyLogs(200);
+      setAllyLogs(rows);
+      setLogsError(null);
+    } catch (err) {
+      setLogsError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLogsLoaded(true);
+      }
+    }, [isTauri]);
+
+    const handleCheckForUpdates = useCallback(async () => {
+      if (!isTauri) {
+        alert("Desktop build required to check for updates.");
+        return;
+      }
+      setUpdateState((prev) => ({ ...prev, status: "checking" }));
       try {
-        const [storedId, storedRegion, storedLang, storedProvider] = await Promise.all([
+        const update = await check();
+        const detail: UpdaterStatusSetting = {
+          checkedAt: new Date().toISOString(),
+          available: Boolean(update),
+          version: update?.version ?? null,
+          error: null,
+        };
+        if (update) {
+          await update.close().catch(() => {});
+        }
+        await setSetting("updater.lastStatus", detail);
+        window.dispatchEvent(new CustomEvent("gt:updater-status", { detail }));
+        if (detail.available) {
+          setUpdateState({
+            status: "available",
+            lastChecked: detail.checkedAt ?? null,
+            version: detail.version ?? null,
+            automatic: false,
+          });
+        } else {
+          setUpdateState({
+            status: "uptodate",
+            lastChecked: detail.checkedAt ?? null,
+            message: "You are already on the latest version.",
+          });
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const detail: UpdaterStatusSetting = {
+          checkedAt: new Date().toISOString(),
+          available: false,
+          version: null,
+          error: message,
+        };
+        await setSetting("updater.lastStatus", detail).catch(() => {});
+        window.dispatchEvent(new CustomEvent("gt:updater-status", { detail }));
+        setUpdateState({
+          status: "error",
+          lastChecked: detail.checkedAt ?? null,
+          message,
+        });
+      }
+    }, [isTauri]);
+
+    const handleInstallUpdate = useCallback(async () => {
+      if (!isTauri || updateState.status !== "available") {
+        return;
+      }
+      setUpdateState((prev) => ({ ...prev, status: "installing" }));
+      try {
+        const update = await check();
+        if (!update) {
+          setUpdateState({
+            status: "uptodate",
+            lastChecked: new Date().toISOString(),
+            message: "No update is currently available.",
+          });
+          return;
+        }
+        try {
+          await update.downloadAndInstall();
+        } finally {
+          await update.close().catch(() => {});
+        }
+        await relaunch();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        setUpdateState({
+          status: "error",
+          lastChecked: new Date().toISOString(),
+          message,
+        });
+      }
+    }, [isTauri, updateState.status]);
+
+    const handleExportDiagnostics = useCallback(async () => {
+      if (!isTauri) {
+        alert("Diagnostics export requires the desktop app.");
+        return;
+      }
+      setDiagnosticsState({ status: "pending" });
+      try {
+        const [logs, digests, settingsRows] = await Promise.all([
+          getRecentAllyLogs(500),
+          getRecentDigests(20),
+          db.settings.toArray(),
+        ]);
+        const versions: Record<string, unknown> = {};
+        try {
+          versions.appVersion = await getVersion();
+        } catch {
+          // ignore
+        }
+        try {
+          const { allyVersion } = await loadAllyBridge();
+          versions.allyVersion = await allyVersion();
+        } catch {
+          // ignore
+        }
+        const consoleLines = getConsoleBufferSnapshot(50);
+        const archivePath = await packDiagnostics({
+          logs,
+          digests,
+          settings: settingsRows,
+          versions,
+          console: consoleLines,
+        });
+        setDiagnosticsState({ status: "ready", path: archivePath, message: null });
+      } catch (error) {
+        setDiagnosticsState({
+          status: "error",
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }, [isTauri]);
+
+    useEffect(() => {
+      let cancelled = false;
+      (async () => {
+        try {
+          const [storedId, storedRegion, storedLang, storedProvider, storedPerfLogging] = await Promise.all([
           getSetting<string>("steam.myId"),
           getSetting<string>("steam.region"),
           getSetting<string>("steam.lang"),
           getSetting<AIProvider>("ai.provider"),
+          getSetting<boolean>("dev.logPerf"),
         ]);
         if (cancelled) return;
         if (storedId) {
@@ -125,25 +393,106 @@ export default function SettingsPage() {
         if (storedProvider === "local" || storedProvider === "ally") {
           setAiProvider(storedProvider);
         }
+        setPerfLoggingEnabled(Boolean(storedPerfLogging));
       } finally {
         if (!cancelled) {
           setSteamSettingsLoaded(true);
         }
       }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+      })();
+      return () => {
+        cancelled = true;
+      };
+    }, []);
+
+    useEffect(() => {
+      if (!isTauri) return;
+      let cancelled = false;
+      (async () => {
+        try {
+          const stored = await getSetting<UpdaterStatusSetting>("updater.lastStatus");
+          if (cancelled || !stored) return;
+          if (stored.error) {
+            setUpdateState({
+              status: "error",
+              lastChecked: stored.checkedAt ?? null,
+              message: stored.error ?? "Update check failed.",
+            });
+          } else if (stored.available) {
+            setUpdateState({
+              status: "available",
+              lastChecked: stored.checkedAt ?? null,
+              version: stored.version ?? null,
+              automatic: true,
+            });
+          } else {
+            setUpdateState({
+              status: "uptodate",
+              lastChecked: stored.checkedAt ?? null,
+              message: "Last automatic check reported no updates.",
+            });
+          }
+        } catch {
+          // ignore stored read errors
+        }
+      })();
+      return () => {
+        cancelled = true;
+      };
+    }, []);
+
+    useEffect(() => {
+      if (!isTauri) return;
+      const handler = (event: Event) => {
+        const detail = (event as CustomEvent<UpdaterEventDetail>).detail;
+        if (!detail) return;
+        if (detail.error) {
+          setUpdateState({
+            status: "error",
+            lastChecked: detail.checkedAt ?? null,
+            message: detail.error ?? "Update check failed.",
+          });
+          return;
+        }
+        if (detail.available) {
+          setUpdateState({
+            status: "available",
+            lastChecked: detail.checkedAt ?? null,
+            version: detail.version ?? null,
+            automatic: detail.automatic ?? false,
+          });
+        } else {
+          const message = detail.cached
+            ? "Skipped automatic update check (recently checked)."
+            : "This device is on the latest available version.";
+          setUpdateState({
+            status: "uptodate",
+            lastChecked: detail.checkedAt ?? null,
+            message,
+          });
+        }
+      };
+      window.addEventListener("gt:updater-status", handler as EventListener);
+      return () => {
+        window.removeEventListener("gt:updater-status", handler as EventListener);
+      };
+    }, []);
 
   useEffect(() => {
+    if (!showAdvanced) {
+      setAllyDataDir(null);
+      return;
+    }
     if (!isTauri) {
       setAllyDataDir(null);
+      setAutomationSettings(null);
+      setAutomationLoaded(true);
       return;
     }
     let cancelled = false;
     (async () => {
       try {
+        const { allyGetDataDir } = await loadAllyBridge();
         const [dir, lastExport, lastEmbed, lastStart] = await Promise.all([
           allyGetDataDir(),
           getSetting<string>("ally.lastExportISO"),
@@ -161,11 +510,30 @@ export default function SettingsPage() {
           setAllyDataDir("Unavailable");
         }
       }
+      if (cancelled) return;
+      try {
+        await refreshAutomation();
+      } catch (err) {
+        console.warn("Failed to load automation settings:", err);
+        setAutomationLoaded(true);
+      }
+      try {
+        const stored = await getSetting<boolean>(AI_SAVE_TRANSCRIPTS_KEY);
+        if (!cancelled) {
+          setSaveTranscripts(stored !== false);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setSaveTranscripts(true);
+        }
+        console.warn("Failed to load transcript preference:", err);
+      }
+      await refreshLogs();
     })();
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [isTauri, refreshAutomation, refreshLogs, showAdvanced]);
 
   useEffect(() => {
     if (!steamSettingsLoaded) return;
@@ -187,13 +555,14 @@ export default function SettingsPage() {
   }, [aiProvider]);
 
   useEffect(() => {
-    if (!isTauri || aiProvider !== "local") {
+    if (!showAdvanced || !isTauri || aiProvider !== "local") {
       setLocalInfo(null);
       return;
     }
     let cancelled = false;
     (async () => {
       try {
+        const { localDetect } = await loadLocalBridge();
         const info = await localDetect();
         if (!cancelled) {
           setLocalInfo(info);
@@ -207,7 +576,7 @@ export default function SettingsPage() {
     return () => {
       cancelled = true;
     };
-  }, [aiProvider]);
+  }, [aiProvider, isTauri, showAdvanced]);
 
   /** Feature flags: covers, IGDB, HLTB, OpenCritic.  Each flag lives in
    * localStorage as "0" or "1".  We provide simple toggles that update
@@ -368,6 +737,9 @@ export default function SettingsPage() {
     }
   };
 
+  const installingUpdate = updateState.status === "installing";
+  const canInstallUpdate = updateState.status === "available" || installingUpdate;
+
   const formatIso = (iso: string | null | undefined) =>
     iso ? new Date(iso).toLocaleString() : "Never";
 
@@ -392,6 +764,7 @@ export default function SettingsPage() {
     }
     try {
       setAllyExportState({ status: "pending" });
+      const { exportAll } = await loadAllyExport();
       const results = await exportAll(label);
       setAllyExportResults(results);
       const iso = new Date().toISOString();
@@ -417,12 +790,15 @@ export default function SettingsPage() {
         // Build simple corpus: identity titles
         const idents = await db.identities.toArray();
         const texts = idents.map((i) => i.title).filter(Boolean).slice(0, 500);
+        const { localEmbed } = await loadLocalBridge();
         const vectors = await localEmbed(texts);
         // Persist to Ally data dir to keep locations consistent
         const payload = JSON.stringify({ label, count: texts.length, dim: vectors[0]?.length ?? 0, texts, vectors });
+        const { allyWriteExport } = await loadAllyBridge();
         await allyWriteExport(label, "vectors.json", payload);
         setAllyEmbedOutput(`Embedded ${texts.length} items locally (dim=${vectors[0]?.length ?? 0}).`);
       } else {
+        const { allyEmbed } = await loadAllyBridge();
         const output = (await allyEmbed(label)).trim();
         setAllyEmbedOutput(output || null);
       }
@@ -448,9 +824,11 @@ export default function SettingsPage() {
       if (aiProvider === "local") {
         // For local, write a small KB marker file so UI can confirm state
         const marker = JSON.stringify({ label, startedAt: new Date().toISOString(), provider: "local" });
+        const { allyWriteExport } = await loadAllyBridge();
         await allyWriteExport(label, "kb.json", marker);
         setAllyStartOutput("Local KB ready.");
       } else {
+        const { allyStartRag } = await loadAllyBridge();
         const output = (await allyStartRag(label)).trim();
         setAllyStartOutput(output || null);
       }
@@ -478,6 +856,64 @@ export default function SettingsPage() {
     await runStartStep();
   };
 
+  const updateAutomation = useCallback(
+    async (patch: Partial<AllyAutomationSettings>) => {
+      try {
+        setAutomationSaving(true);
+        const updated = await saveAutomationSettings(patch);
+        setAutomationSettings(updated);
+      } catch (err) {
+        console.warn("Failed to update automation settings:", err);
+      } finally {
+        setAutomationSaving(false);
+      }
+    },
+    [],
+  );
+
+  const handleAutomationRun = useCallback(async () => {
+    if (!isTauri) {
+      setAutomationRunState({ status: "error", message: "Desktop-only feature.", error: "Desktop-only feature." });
+      return;
+    }
+    try {
+      setAutomationRunState({ status: "pending" });
+      const { runExportEmbedStart } = await loadAllyRunbook();
+      await runExportEmbedStart(ALLY_LABEL);
+      const stamp = new Date().toISOString();
+      await updateAutomation({
+        lastExportISO: stamp,
+        lastEmbedISO: stamp,
+        lastStartISO: stamp,
+      });
+      setAutomationRunState({ status: "success", message: "Export->Embed->Start completed." });
+      await refreshLogs();
+    } catch (err) {
+      setAutomationRunState({
+        status: "error",
+        message: "Automation run failed.",
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }, [isTauri, refreshLogs, updateAutomation]);
+
+  const handleAutomationUpdated = useCallback(
+    async (settings: AllyAutomationSettings) => {
+      setAutomationSettings(settings);
+      await refreshLogs();
+    },
+    [refreshLogs],
+  );
+
+  const handleClearLogs = useCallback(async () => {
+    if (!isTauri) return;
+    const { clearAllyLogs } = await loadAllyLog();
+    await clearAllyLogs();
+    setAllyLogs([]);
+    setLogsLoaded(true);
+    setLogsError(null);
+  }, [isTauri]);
+
   const handleLocalChatTest = async () => {
     if (!isTauri || aiProvider !== "local") {
       setLocalChatState({ status: "error", message: "Switch provider to Local to run this test.", error: "Local provider inactive." });
@@ -485,6 +921,7 @@ export default function SettingsPage() {
     }
     try {
       setLocalChatState({ status: "pending" });
+      const { localChat } = await loadLocalBridge();
       const reply = await localChat("Hello! Please confirm the local model is online.");
       setLocalChatOutput(reply);
       setLocalChatState({ status: "success", message: "Reply received." });
@@ -502,6 +939,7 @@ export default function SettingsPage() {
       setLocalEmbedState({ status: "pending" });
       const sample = await db.identities.orderBy("title").limit(3).toArray();
       const texts = sample.length ? sample.map((entry) => entry.title ?? "") : ["Sample text", "Another sample", "Final sample"];
+      const { localEmbed } = await loadLocalBridge();
       const vectors = await localEmbed(texts);
       const dim = vectors[0]?.length ?? 0;
       setLocalEmbedSummary(`Generated ${vectors.length} vectors (dim ${dim}).`);
@@ -535,14 +973,20 @@ export default function SettingsPage() {
       setChatState({ status: "error", message: "Desktop-only feature.", error: "Desktop-only feature." });
       return;
     }
+    const { getOrCreateSession } = await loadAllySession();
     const session = getOrCreateSession();
     setChatSession(session);
     setChatState({ status: "pending" });
     setChatHistory((prev) => [...prev, { role: "user", content: trimmed }]);
     try {
-      const raw = aiProvider === "local"
-        ? await localChat(trimmed)
-        : await allyChat(session, trimmed, false);
+      let raw: string;
+      if (aiProvider === "local") {
+        const { localChat } = await loadLocalBridge();
+        raw = await localChat(trimmed);
+      } else {
+        const { allyChat } = await loadAllyBridge();
+        raw = await allyChat(session, trimmed, false);
+      }
       let content = raw.trim();
       let isJson = false;
       if (content) {
@@ -564,7 +1008,8 @@ export default function SettingsPage() {
     }
   };
 
-  const handleResetChatSession = () => {
+  const handleResetChatSession = async () => {
+    const { resetSession } = await loadAllySession();
     resetSession();
     setChatSession(null);
     setChatHistory([]);
@@ -694,10 +1139,10 @@ export default function SettingsPage() {
 
   async function clearRawgCaches() {
     try {
-      const { games, explore } = await clearRawgCache();
+      const { games, explore, lists } = await clearRawgCache();
       clearRawgApiCache();
       alert(
-        `RAWG cache cleared (${games} detail entr${games === 1 ? "y" : "ies"}, ${explore} explore entr${explore === 1 ? "y" : "ies"}).`,
+        `RAWG cache cleared (${games} detail entr${games === 1 ? "y" : "ies"}, ${explore} explore entr${explore === 1 ? "y" : "ies"}, ${lists} list entr${lists === 1 ? "y" : "ies"}).`,
       );
     } catch (e: any) {
       alert(e?.message || "Failed to clear RAWG cache.");
@@ -764,15 +1209,32 @@ export default function SettingsPage() {
           </label>
         </div>
         <p className="text-xs text-zinc-500">
-          When all vendors are enabled the enrichment pipeline tries Steam → HLTB → RAWG for playtime and
-          Metacritic → OpenCritic for critic scores.
+          When all vendors are enabled the enrichment pipeline tries Steam -&gt; HLTB -&gt; RAWG for playtime and
+          Metacritic -&gt; OpenCritic for critic scores.
         </p>
       </section>
 
       <section className="space-y-3">
-        <h2 className="text-lg font-medium">AI / Ally</h2>
-        <div className="space-y-3 rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
-          {isTauri ? (
+        <div className="flex items-center justify-between">
+          <h2 className="text-lg font-medium">AI / Ally</h2>
+          <button
+            type="button"
+            className="btn-ghost text-sm text-zinc-600"
+            onClick={() => setShowAdvanced((prev) => !prev)}
+          >
+            {showAdvanced ? "Hide advanced" : "Show advanced"}
+          </button>
+        </div>
+        {showAdvanced ? (
+          <Suspense
+            fallback={
+              <div className="rounded-2xl border border-dashed border-zinc-200 bg-white p-4 text-sm text-zinc-500">
+                Loading AI / Ally settings…
+              </div>
+            }
+          >
+            <div className="space-y-3 rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
+              {isTauri ? (
             <>
               <div className="flex flex-wrap items-center gap-3">
                 <button
@@ -781,6 +1243,7 @@ export default function SettingsPage() {
                   onClick={async () => {
                     try {
                       setAllyState({ status: "pending" });
+                      const { allyVersion } = await loadAllyBridge();
                       const v = await allyVersion();
                       setAllyState({ status: "success", message: v || "ally" });
                     } catch (err) {
@@ -843,7 +1306,7 @@ export default function SettingsPage() {
                       ) : null}
                     </div>
                   ) : (
-                    <p className="mt-1">Searching for models…</p>
+                    <p className="mt-1">Searching for models...</p>
                   )}
                 </div>
               ) : null}
@@ -854,23 +1317,285 @@ export default function SettingsPage() {
                 </details>
               ) : null}
 
-              <div className="text-xs text-zinc-500">
-                <div>
-                  Data directory: {allyDataDir ? (
-                    <span className="font-mono text-zinc-700">{allyDataDir}</span>
+            <div className="text-xs text-zinc-500">
+              <div>
+                Data directory: {allyDataDir ? (
+                  <span className="font-mono text-zinc-700">{allyDataDir}</span>
+                ) : (
+                  "Resolving..."
+                )}
+              </div>
+              <div>Last export: {formatIso(lastAllyExportISO)}</div>
+              <div>Last embed: {formatIso(lastAllyEmbedISO)}</div>
+              <div>Last knowledge base start: {formatIso(lastAllyStartISO)}</div>
+            </div>
+            <div className="flex flex-wrap items-center gap-3 text-sm text-zinc-700">
+              <label className="inline-flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={perfLoggingEnabled}
+                  onChange={(event) => {
+                    const value = event.target.checked;
+                    setPerfLoggingEnabled(value);
+                    void setSetting("dev.logPerf", value);
+                  }}
+                />
+                <span>Log performance to console (&gt;= 20 ms)</span>
+              </label>
+            </div>
+            <div className="flex flex-wrap items-center gap-3 text-sm text-zinc-700">
+              <label className="inline-flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={saveTranscripts}
+                  onChange={(event) => {
+                    const value = event.target.checked;
+                    setSaveTranscripts(value);
+                    void setSetting(AI_SAVE_TRANSCRIPTS_KEY, value);
+                    window.dispatchEvent(new CustomEvent("ally:transcripts-toggle", { detail: value }));
+                  }}
+                />
+                <span>Save transcripts locally (Dexie only, never leaves this device).</span>
+              </label>
+              <button
+                type="button"
+                className="btn-ghost"
+                onClick={async () => {
+                  setClearingTranscripts(true);
+                  try {
+                    await clearTranscripts();
+                  } catch (err) {
+                    console.warn("Failed to clear transcripts:", err);
+                  } finally {
+                    setClearingTranscripts(false);
+                  }
+                }}
+                disabled={clearingTranscripts}
+              >
+                {clearingTranscripts ? "Clearing..." : "Clear transcripts"}
+              </button>
+            </div>
+
+            <div className="border-t border-zinc-200 pt-3">
+              <AllyDigestCard onUpdate={handleAutomationUpdated} />
+            </div>
+
+            <div className="space-y-3 border-t border-zinc-200 pt-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-500">Automations</h3>
+                {automationSaving ? <span className="text-xs text-zinc-500">Saving...</span> : null}
+              </div>
+              {!automationLoaded ? (
+                <p className="text-xs text-zinc-500">Loading automation settings...</p>
+              ) : (
+                <>
+                  <label className="inline-flex items-center gap-2 text-sm text-zinc-700">
+                    <input
+                      type="checkbox"
+                      checked={Boolean(automationSettings?.enabled)}
+                      onChange={(event) => {
+                        void updateAutomation({ enabled: event.target.checked });
+                      }}
+                      disabled={automationSaving}
+                    />
+                    <span>Enable nightly export/embed/start loop</span>
+                  </label>
+                  <div className="grid gap-3 md:grid-cols-2">
+                    <label className="flex flex-col text-sm text-zinc-700">
+                      <span className="font-medium">Export / Embed / Start time</span>
+                      <input
+                        type="time"
+                        className="input mt-1"
+                        value={automationSettings?.exportEmbedStartTime ?? "22:30"}
+                        onChange={(event) => {
+                          const value = event.target.value || "22:30";
+                          void updateAutomation({ exportEmbedStartTime: value });
+                        }}
+                        disabled={!automationSettings?.enabled || automationSaving}
+                      />
+                    </label>
+                    <label className="flex flex-col text-sm text-zinc-700">
+                      <span className="font-medium">Digest time</span>
+                      <input
+                        type="time"
+                        className="input mt-1"
+                        value={automationSettings?.digestTime ?? "09:00"}
+                        onChange={(event) => {
+                          const value = event.target.value || "09:00";
+                          void updateAutomation({ digestTime: value });
+                        }}
+                        disabled={!automationSettings?.enabled || automationSaving}
+                      />
+                    </label>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-3 text-sm text-zinc-700">
+                    <label className="inline-flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={Boolean(automationSettings?.digestEnabled)}
+                        onChange={(event) => {
+                          void updateAutomation({ digestEnabled: event.target.checked });
+                        }}
+                        disabled={!automationSettings?.enabled || automationSaving}
+                      />
+                      <span>Daily digest</span>
+                    </label>
+                    <label className="inline-flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={Boolean(automationSettings?.digestAllowWeb)}
+                        onChange={(event) => {
+                          void updateAutomation({ digestAllowWeb: event.target.checked });
+                        }}
+                        disabled={
+                          !automationSettings?.enabled ||
+                          !automationSettings?.digestEnabled ||
+                          automationSaving
+                        }
+                      />
+                      <span>Allow web fallback</span>
+                    </label>
+                    <label className="inline-flex items-center gap-2">
+                      <span className="font-medium">Scope</span>
+                      <select
+                        className="input"
+                        value={automationSettings?.digestScope ?? "coach"}
+                        onChange={(event) => {
+                          const scope = event.target.value as AllyAutomationSettings["digestScope"];
+                          void updateAutomation({ digestScope: scope });
+                        }}
+                        disabled={
+                          !automationSettings?.enabled ||
+                          !automationSettings?.digestEnabled ||
+                          automationSaving
+                        }
+                      >
+                        <option value="coach">Coach (play next)</option>
+                        <option value="deals">Deals</option>
+                        <option value="both">Both</option>
+                      </select>
+                    </label>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      className="btn"
+                      onClick={handleAutomationRun}
+                      disabled={automationRunState.status === "pending"}
+                    >
+                      {automationRunState.status === "pending"
+                        ? "Running..."
+                        : "Run Export -> Embed -> Start now"}
+                    </button>
+                    {automationRunState.status === "success" && automationRunState.message ? (
+                      <span className="text-xs text-emerald-600">{automationRunState.message}</span>
+                    ) : null}
+                    {automationRunState.status === "error" && automationRunState.error ? (
+                      <span className="text-xs text-rose-600">
+                        {automationRunState.message} {automationRunState.error}
+                      </span>
+                    ) : null}
+                  </div>
+                  <div className="grid gap-2 text-xs text-zinc-500 md:grid-cols-2">
+                    <div>Last export: {formatIso(automationSettings?.lastExportISO)}</div>
+                    <div>Last embed: {formatIso(automationSettings?.lastEmbedISO)}</div>
+                    <div>Last start: {formatIso(automationSettings?.lastStartISO)}</div>
+                    <div className="flex items-center gap-2">
+                      <span>Last digest: {formatIso(automationSettings?.lastDigestISO)}</span>
+                      {automationSettings?.lastDigestISO ? (
+                        <span
+                          className={
+                            automationSettings?.lastDigestStatus === "error"
+                              ? "rounded-full bg-rose-100 px-2 py-0.5 text-[10px] font-semibold text-rose-700"
+                              : "rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-semibold text-emerald-700"
+                          }
+                        >
+                          {(automationSettings?.lastDigestStatus ?? "ok").toUpperCase()}
+                        </span>
+                      ) : null}
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
+
+            <div className="border-t border-zinc-200 pt-3">
+              <details
+                className="rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2"
+                open={logsExpanded}
+                onToggle={(event) => setLogsExpanded(event.currentTarget.open)}
+              >
+                <summary className="cursor-pointer text-xs font-semibold uppercase tracking-wide text-zinc-500">
+                  Automation logs
+                </summary>
+                <div className="mt-2 space-y-2 text-xs text-zinc-600">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      className="btn-ghost"
+                      onClick={() => void refreshLogs()}
+                      disabled={!logsLoaded}
+                    >
+                      Refresh
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-ghost"
+                      onClick={() => void handleClearLogs()}
+                      disabled={!logsLoaded || allyLogs.length === 0}
+                    >
+                      Clear
+                    </button>
+                    {logsError ? <span className="text-rose-600">{logsError}</span> : null}
+                  </div>
+                  {!logsLoaded ? (
+                    <p className="text-xs text-zinc-500">Loading logs...</p>
+                  ) : allyLogs.length === 0 ? (
+                    <p className="text-xs text-zinc-500">No log entries yet.</p>
                   ) : (
-                    "Resolving..."
+                    <ul className="max-h-48 space-y-1 overflow-auto rounded border border-zinc-200 bg-white p-2">
+                      {allyLogs.map((entry) => (
+                        <li
+                          key={entry.id ?? entry.atISO}
+                          className="space-y-1 border-b border-zinc-100 pb-1 last:border-0"
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <span className="font-medium text-zinc-700">
+                              {new Date(entry.atISO).toLocaleString()}
+                            </span>
+                            <span
+                              className={
+                                entry.level === "error"
+                                  ? "rounded-full bg-rose-100 px-2 py-0.5 text-[10px] font-semibold text-rose-700"
+                                  : entry.level === "warn"
+                                  ? "rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-700"
+                                  : "rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-semibold text-emerald-700"
+                              }
+                            >
+                              {entry.level.toUpperCase()}
+                            </span>
+                          </div>
+                          <div className="text-[11px] text-zinc-600">{entry.msg}</div>
+                          {entry.ctx ? (
+                            <details className="text-[10px] text-zinc-500">
+                              <summary className="cursor-pointer">Context</summary>
+                              <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap rounded bg-zinc-100 p-2 text-[10px] text-zinc-700">
+                                {JSON.stringify(entry.ctx, null, 2)}
+                              </pre>
+                            </details>
+                          ) : null}
+                        </li>
+                      ))}
+                    </ul>
                   )}
                 </div>
-                <div>Last export: {formatIso(lastAllyExportISO)}</div>
-                <div>Last embed: {formatIso(lastAllyEmbedISO)}</div>
-                <div>Last knowledge base start: {formatIso(lastAllyStartISO)}</div>
-              </div>
+              </details>
+            </div>
 
-              {aiProvider === "local" ? (
-                <div className="rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2">
-                  <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-500">Local sanity checks</h3>
-                  <div className="mt-2 flex flex-wrap items-center gap-2">
+            {aiProvider === "local" ? (
+              <div className="rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2">
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-500">Local sanity checks</h3>
+                <div className="mt-2 flex flex-wrap items-center gap-2">
                     <button
                       type="button"
                       className="btn-ghost"
@@ -995,7 +1720,7 @@ export default function SettingsPage() {
                       allyStartState.status === "pending"
                     }
                   >
-                    {bootstrapRunning ? "Running..." : "Run all (Export → Embed → Start)"}
+                    {bootstrapRunning ? "Running..." : "Run all (Export -> Embed -> Start)"}
                   </button>
                   <button
                     type="button"
@@ -1125,6 +1850,12 @@ export default function SettingsPage() {
             <p className="text-sm text-zinc-600">AI sidecar requires desktop build.</p>
           )}
         </div>
+        </Suspense>
+        ) : (
+          <p className="text-sm text-zinc-600">
+            Advanced AI and automation settings are hidden to improve load time. Select Show to configure Ally or local models.
+          </p>
+        )}
       </section>
 
       {/* Card layout fixed to "Large" size.  The card width is set globally to 340px via CSS. */}
@@ -1286,6 +2017,77 @@ export default function SettingsPage() {
         )}
       </section>
 
+      {isTauri ? (
+        <section className="space-y-3">
+          <h2 className="text-lg font-medium">Updates</h2>
+          <p className="text-sm text-zinc-600">
+            Last checked:{" "}
+            {updateState.lastChecked ? formatIso(updateState.lastChecked) : "No checks performed yet."}
+          </p>
+          {updateState.status === "available" ? (
+            <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-700">
+              Update available{updateState.version ? ` (v${updateState.version})` : ""}. Install to restart the desktop
+              app.
+            </div>
+          ) : null}
+          {updateState.status === "error" && updateState.message ? (
+            <div className="rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-600">
+              {updateState.message}
+            </div>
+          ) : null}
+          {updateState.status === "uptodate" && updateState.message ? (
+            <p className="text-xs text-emerald-600">{updateState.message}</p>
+          ) : null}
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              className="btn"
+              onClick={handleCheckForUpdates}
+              disabled={updateState.status === "checking" || installingUpdate}
+            >
+              {updateState.status === "checking" ? "Checking..." : "Check for updates"}
+            </button>
+            {canInstallUpdate ? (
+              <button
+                type="button"
+                className="btn"
+                onClick={handleInstallUpdate}
+                disabled={installingUpdate}
+              >
+                {installingUpdate ? "Installing..." : "Install and restart"}
+              </button>
+            ) : null}
+          </div>
+        </section>
+      ) : null}
+
+      {isTauri ? (
+        <section className="space-y-3">
+          <h2 className="text-lg font-medium">Diagnostics</h2>
+          <p className="text-sm text-zinc-600">
+            Collect logs, recent digests, and settings into a zip for troubleshooting.
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              className="btn"
+              onClick={handleExportDiagnostics}
+              disabled={diagnosticsState.status === "pending"}
+            >
+              {diagnosticsState.status === "pending" ? "Exporting..." : "Export diagnostics (zip)"}
+            </button>
+          </div>
+          {diagnosticsState.status === "ready" && diagnosticsState.path ? (
+            <p className="text-xs text-emerald-600">
+              Saved to <span className="font-semibold">{diagnosticsState.path}</span>.
+            </p>
+          ) : null}
+          {diagnosticsState.status === "error" && diagnosticsState.message ? (
+            <p className="text-xs text-rose-600">Export failed: {diagnosticsState.message}</p>
+          ) : null}
+        </section>
+      ) : null}
+
       <section className="space-y-3">
         <h2 className="text-lg font-medium">Data</h2>
         <div className="flex flex-wrap gap-2">
@@ -1365,5 +2167,3 @@ export default function SettingsPage() {
     </div>
   );
 }
-
-

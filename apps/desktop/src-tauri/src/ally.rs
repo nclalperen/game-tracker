@@ -31,8 +31,35 @@ fn bundled_ally_dir(app: &tauri::AppHandle) -> PathBuf {
     .join("ally")
 }
 
-fn bundled_main_path(app: &tauri::AppHandle) -> PathBuf {
+fn bundled_python_entry(app: &tauri::AppHandle) -> PathBuf {
   bundled_ally_dir(app).join("main.py")
+}
+
+fn bundled_ally_bin(app: &tauri::AppHandle) -> Option<PathBuf> {
+  let base = bundled_ally_dir(app);
+  let mut candidates: Vec<PathBuf> = Vec::new();
+  #[cfg(target_os = "windows")]
+  {
+    candidates.push(base.join("win").join("ally.exe"));
+    candidates.push(base.join("win").join("ally"));
+    candidates.push(base.join("ally.exe"));
+  }
+  #[cfg(target_os = "macos")]
+  {
+    candidates.push(base.join("mac").join("ally"));
+    candidates.push(base.join("ally"));
+  }
+  #[cfg(target_os = "linux")]
+  {
+    candidates.push(base.join("linux").join("ally"));
+    candidates.push(base.join("ally"));
+  }
+  for candidate in candidates {
+    if candidate.exists() {
+      return Some(candidate);
+    }
+  }
+  None
 }
 
 #[cfg(target_os = "windows")]
@@ -66,6 +93,19 @@ fn run_python(main_script: &Path, args: &[&str]) -> Result<std::process::Output,
   ))
 }
 
+fn command_preview(cmd: &Command) -> String {
+  let program = cmd.get_program().to_string_lossy().to_string();
+  let args: Vec<String> = cmd
+    .get_args()
+    .map(|arg| arg.to_string_lossy().to_string())
+    .collect();
+  if args.is_empty() {
+    program
+  } else {
+    format!("{} {}", program, args.join(" "))
+  }
+}
+
 fn run_configured_binary(bin: &str, args: &[&str]) -> Result<std::process::Output, String> {
   let bin_path = PathBuf::from(bin);
   let mut command = if bin_path.exists() {
@@ -81,7 +121,10 @@ fn run_configured_binary(bin: &str, args: &[&str]) -> Result<std::process::Outpu
   };
 
   command.args(args);
-  command.output().map_err(|e| e.to_string())
+  let preview = command_preview(&command);
+  command
+    .output()
+    .map_err(|e| format!("ally exec failed: {} :: {}", preview, e))
 }
 
 fn build_base_command(app: &tauri::AppHandle, args: &[&str]) -> Result<Command, String> {
@@ -110,7 +153,18 @@ fn build_base_command(app: &tauri::AppHandle, args: &[&str]) -> Result<Command, 
     return Ok(cmd);
   }
 
-  let main_script = bundled_main_path(app);
+  if let Some(bin_path) = bundled_ally_bin(app) {
+    let mut cmd = Command::new(&bin_path);
+    if let Some(parent) = bin_path.parent() {
+      if !parent.as_os_str().is_empty() {
+        cmd.current_dir(parent);
+      }
+    }
+    cmd.args(args);
+    return Ok(cmd);
+  }
+
+  let main_script = bundled_python_entry(app);
   let workdir = main_script.parent().unwrap_or_else(|| Path::new("."));
   for candidate in PYTHON_CANDIDATES {
     let mut cmd = Command::new(candidate);
@@ -140,36 +194,52 @@ fn exec_with_stdin(
   cmd.stdout(Stdio::piped());
   cmd.stderr(Stdio::piped());
 
-  let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+  let preview = command_preview(&cmd);
+  let mut child = cmd
+    .spawn()
+    .map_err(|e| format!("ally exec failed: {} :: {}", preview, e))?;
 
   if let Some(body) = stdin_payload {
     if let Some(mut stdin) = child.stdin.take() {
-      stdin.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
+      stdin
+        .write_all(body.as_bytes())
+        .map_err(|e| format!("ally stdin write failed: {} :: {}", preview, e))?;
     } else {
-      return Err("ally command missing stdin".into());
+      return Err(format!("ally command missing stdin: {}", preview));
     }
   }
 
   let start = Instant::now();
   loop {
-    if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-      let output = child.wait_with_output().map_err(|e| e.to_string())?;
+    if let Some(status) = child
+      .try_wait()
+      .map_err(|e| format!("ally exec poll failed: {} :: {}", preview, e))?
+    {
+      let output = child
+        .wait_with_output()
+        .map_err(|e| format!("ally exec wait failed: {} :: {}", preview, e))?;
+      let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+      let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
       if status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+        return Ok(stdout);
       } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return if stderr.is_empty() {
-          Err("ally command failed".into())
-        } else {
-          Err(stderr)
-        };
+        if !stderr.is_empty() && !stdout.is_empty() {
+          return Err(format!("{} :: {}\n{}", preview, stderr, stdout));
+        }
+        if !stderr.is_empty() {
+          return Err(format!("{} :: {}", preview, stderr));
+        }
+        if !stdout.is_empty() {
+          return Err(format!("{} :: {}", preview, stdout));
+        }
+        return Err(format!("ally command failed without output: {}", preview));
       }
     }
 
     if start.elapsed() > timeout {
       let _ = child.kill();
       let _ = child.wait();
-      return Err("ally command timeout".into());
+      return Err(format!("ally command timeout: {}", preview));
     }
 
     std::thread::sleep(Duration::from_millis(50));
@@ -180,15 +250,19 @@ pub fn ally_exec(app: &tauri::AppHandle, args: &[&str]) -> Result<String, String
   let mode = ally_mode();
   let output = if mode.eq_ignore_ascii_case("docker") {
     let name = env::var("ALLY_DOCKER_NAME").unwrap_or_else(|_| "ally".into());
-    Command::new("docker")
-      .args(["exec", &name, "ally"])
-      .args(args)
+    let mut cmd = Command::new("docker");
+    cmd.args(["exec", &name, "ally"]).args(args);
+    let preview = command_preview(&cmd);
+    cmd
       .output()
-      .map_err(|e| e.to_string())?
+      .map_err(|e| format!("ally exec failed: {} :: {}", preview, e))?
   } else if let Some(bin) = ally_bin_env() {
     run_configured_binary(&bin, args)?
+  } else if let Some(bin_path) = bundled_ally_bin(app) {
+    let bin_string = bin_path.to_string_lossy().to_string();
+    run_configured_binary(&bin_string, args)?
   } else {
-    let main_script = bundled_main_path(app);
+    let main_script = bundled_python_entry(app);
     run_python(&main_script, args)?
   };
 
@@ -218,10 +292,14 @@ pub fn ally_data_dir_path() -> PathBuf {
 
 pub fn ally_write_file(label: &str, filename: &str, contents: &str) -> Result<usize, String> {
   let dir = ally_data_dir().join(label);
-  fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+  fs::create_dir_all(&dir)
+    .map_err(|e| format!("failed to create ally data dir {} :: {}", dir.display(), e))?;
   let path = dir.join(filename);
-  let mut f = fs::File::create(&path).map_err(|e| e.to_string())?;
-  f.write_all(contents.as_bytes()).map_err(|e| e.to_string())?;
+  let mut f = fs::File::create(&path)
+    .map_err(|e| format!("failed to create ally file {} :: {}", path.display(), e))?;
+  f
+    .write_all(contents.as_bytes())
+    .map_err(|e| format!("failed to write ally file {} :: {}", path.display(), e))?;
   Ok(contents.len())
 }
 

@@ -39,3 +39,16 @@ export async function fetchOpenCriticScore(title: string): Promise<number | null
   const res = await invoke<number | null>("get_opencritic_score", { title });
   return res ?? null;
 }
+
+export type DiagnosticsPayload = {
+  logs: unknown[];
+  digests: unknown[];
+  settings: unknown[];
+  versions?: Record<string, unknown>;
+  console: string[];
+};
+
+export async function packDiagnostics(payload: DiagnosticsPayload): Promise<string> {
+  if (!isTauri) throw new Error("Desktop-only: diagnostics export requires the Tauri app.");
+  return await invoke<string>("pack_diagnostics_cmd", payload);
+}

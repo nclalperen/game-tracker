@@ -12,3 +12,8 @@ export * from "./data/platforms";
 export * from "./finishPlanner";
 export * from "./data/steamIndex";
 export * from "./ally/schemas";
+export * from "./ally/prompts";
+export * from "./ally/schema";
+export * from "./ally/repair";
+export * from "./ally/features";
+export * from "./deals/score";

@@ -21,5 +21,15 @@
     "targets": ["msi"],
     "windows": { "webviewInstallMode": { "type": "downloadBootstrapper" } },
     "resources": ["bin/ally/**/*", "bin/llama/**/*", "models/**/*"]
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "dialog": false,
+      "endpoints": [
+        "https://updates.example.com/game-tracker/{{target}}/{{current_version}}"
+      ],
+      "pubkey": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEt5npJNmPR9U1FVLtZL1NVr7DiIP9N6byjHgNsx3Rp3XIan+FJxuxMxDPZWS9Vyuk3F7S3w7Dnk3a1JpN96CBQ=="
+    }
   }
 }

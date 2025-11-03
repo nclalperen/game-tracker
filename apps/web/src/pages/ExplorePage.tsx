@@ -1,83 +1,56 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import clsx from "clsx";
+import { listTrending, listUpcoming, listNewReleases } from "@/apis/rawg";
 import {
   db,
-  getRawgExploreRow,
-  isRawgExploreStale,
-  upsertRawgExploreRow,
-  type RawgExploreResult,
+  type RawgListItem,
+  getRawgListRow,
+  upsertRawgListRow,
+  isRawgListStale,
+  pruneRawgLists,
+  addWishlistItem,
+  removeWishlistItem,
+  WISHLIST_SOURCE_USER,
 } from "@/db";
-import { listGames } from "@/apis/rawg";
-import { getStoreInfo } from "@/data/storeMap";
-import clsx from "clsx";
-import Drawer from "@/components/details/Drawer";
-import { canonicalPlatform, nanoid, type Identity, type LibraryItem } from "@tracker/core";
+import { useWishlistSnapshot } from "@/hooks/useWishlistSnapshot";
 
 const GameDetails = lazy(() => import("../components/details/GameDetails"));
 
-type CategoryKey = "trending" | "top-rated" | "upcoming";
-type PlatformKey = "all" | "pc" | "playstation" | "xbox" | "nintendo";
+type TabKey = "trending" | "upcoming" | "new";
 
-const PLATFORM_PARENT_IDS: Record<Exclude<PlatformKey, "all">, string> = {
-  pc: "1",
-  playstation: "2",
-  xbox: "3",
-  nintendo: "7",
+type ExploreState =
+  | { status: "loading"; items: RawgListItem[] }
+  | { status: "ready"; items: RawgListItem[]; fetchedAt: string }
+  | { status: "error"; items: RawgListItem[]; message: string };
+
+type SuggestedTabConfig = {
+  label: string;
+  description: string;
 };
 
-const CATEGORY_CONFIG: Record<
-  CategoryKey,
-  {
-    label: string;
-    buildParams: (platform: PlatformKey) => Record<string, string | number | boolean | undefined>;
-    description: string;
-  }
-> = {
-  "trending": {
+const TAB_CONFIG: Record<TabKey, SuggestedTabConfig> = {
+  trending: {
     label: "Trending",
-    description: "Most added games in the past 30 days.",
-    buildParams: (platform) => {
-      const now = new Date();
-      const to = formatDateForQuery(now);
-      const from = formatDateForQuery(addDays(now, -30));
-      return {
-        ordering: "-added",
-        dates: `${from},${to}`,
-        page_size: 24,
-        parent_platforms: platform === "all" ? undefined : PLATFORM_PARENT_IDS[platform],
-      };
-    },
+    description: "Most played and most added games over the last month.",
   },
-  "top-rated": {
-    label: "Top Rated",
-    description: "Highest rated releases from the last year.",
-    buildParams: (platform) => {
-      const now = new Date();
-      const to = formatDateForQuery(now);
-      const from = formatDateForQuery(addDays(now, -365));
-      return {
-        ordering: "-rating",
-        dates: `${from},${to}`,
-        page_size: 24,
-        parent_platforms: platform === "all" ? undefined : PLATFORM_PARENT_IDS[platform],
-      };
-    },
-  },
-  "upcoming": {
+  upcoming: {
     label: "Upcoming",
-    description: "Most anticipated releases scheduled for the next 6 months.",
-    buildParams: (platform) => {
-      const now = new Date();
-      const from = formatDateForQuery(now);
-      const to = formatDateForQuery(addDays(now, 180));
-      return {
-        ordering: "-added",
-        dates: `${from},${to}`,
-        page_size: 24,
-        parent_platforms: platform === "all" ? undefined : PLATFORM_PARENT_IDS[platform],
-      };
-    },
+    description: "Big releases arriving in the next few months.",
+  },
+  new: {
+    label: "New Releases",
+    description: "Fresh launches from the past few weeks.",
   },
 };
+
+const FETCHERS: Record<TabKey, (page: number) => Promise<any>> = {
+  trending: listTrending,
+  upcoming: listUpcoming,
+  new: listNewReleases,
+};
+
+type IdentityMap = Map<number, string>;
+type Notice = { kind: "info" | "error"; message: string };
 
 function prefetchGameDetailsLazy(identityId: string) {
   void import("../components/details/GameDetails")
@@ -89,303 +62,254 @@ function prefetchGameDetailsLazy(identityId: string) {
     .catch(() => {});
 }
 
-function invalidateGameDetailsLazy(identityId: string) {
-  void import("../components/details/GameDetails")
-    .then((mod) => {
-      if (typeof mod.invalidateGameDetails === "function") {
-        mod.invalidateGameDetails(identityId);
-      }
-    })
-    .catch(() => {});
+function mapResultToItem(result: any): RawgListItem {
+  const genres = Array.isArray(result.genres) ? result.genres.map((g: any) => g?.name).filter(Boolean) : [];
+  const platforms = Array.isArray(result.platforms)
+    ? result.platforms
+        .map((entry: any) => entry?.platform?.name ?? entry?.name)
+        .filter((name: unknown): name is string => typeof name === "string" && name.length > 0)
+    : [];
+  const stores = Array.isArray(result.stores)
+    ? result.stores
+        .map((entry: any) => {
+          const id = entry?.store?.id ?? entry?.id ?? 0;
+          const name = entry?.store?.name ?? entry?.name ?? "";
+          const domain = entry?.store?.domain ?? entry?.domain ?? null;
+          const url = typeof entry?.url === "string" ? entry.url : null;
+          if (!name) return null;
+          return {
+            id,
+            name,
+            domain,
+            url,
+          };
+        })
+        .filter((value: unknown): value is { id: number; name: string; domain: string | null; url: string | null } => Boolean(value))
+    : [];
+  return {
+    id: result.id,
+    slug: result.slug,
+    title: result.name ?? result.slug ?? "Untitled",
+    backgroundImage: result.background_image ?? result.backgroundImage ?? null,
+    genres,
+    platforms,
+    stores,
+    metacritic: typeof result.metacritic === "number" ? result.metacritic : null,
+  };
 }
 
-type ExploreState =
-  | { status: "loading"; data: RawgExploreResult[] }
-  | { status: "ready"; data: RawgExploreResult[]; fetchedAt: string }
-  | { status: "error"; message: string; data: RawgExploreResult[] };
+function extractSteamAppId(stores: RawgListItem["stores"]): number | null {
+  for (const store of stores ?? []) {
+    const isSteamStore = store.id === 1 || (store.name ?? "").toLowerCase().includes("steam");
+    if (!isSteamStore) continue;
+    const source = store.url ?? "";
+    const match = source.match(/\/app\/(\d+)/i);
+    if (match) {
+      const appid = Number(match[1]);
+      if (Number.isFinite(appid) && appid > 0) {
+        return appid;
+      }
+    }
+  }
+  return null;
+}
 
-export default function ExplorePage() {
-  const [category, setCategory] = useState<CategoryKey>("trending");
-  const [platform, setPlatform] = useState<PlatformKey>("all");
-  const [state, setState] = useState<ExploreState>({ status: "loading", data: [] });
-  const [existingRawgIds, setExistingRawgIds] = useState<Set<number>>(new Set());
-  const [pendingAddKeys, setPendingAddKeys] = useState<Set<string>>(new Set());
-  const [viewLoadingKey, setViewLoadingKey] = useState<string | null>(null);
-  const [drawerId, setDrawerId] = useState<string | null>(null);
-  const [toast, setToast] = useState<{ kind: "success" | "error"; message: string } | null>(null);
+function fallbackManualAppId(rawgId: number): number {
+  const base = Math.abs(rawgId);
+  return base > 0 ? -base : -1;
+}
+
+export default function ExplorePage(): JSX.Element {
+  const [tab, setTab] = useState<TabKey>("trending");
+  const [state, setState] = useState<ExploreState>({ status: "loading", items: [] });
+  const [identityMap, setIdentityMap] = useState<IdentityMap>(new Map());
+  const [expandedIdentityId, setExpandedIdentityId] = useState<string | null>(null);
+  const [notice, setNotice] = useState<Notice | null>(null);
+  const { manual: manualWishlistAppIds, all: allWishlistAppIds, refresh: refreshWishlist } =
+    useWishlistSnapshot((message) => setNotice({ kind: "error", message }));
+  const [pendingWishlistAppIds, setPendingWishlistAppIds] = useState<Set<number>>(new Set());
+
+  const readyKey = useMemo(() => {
+    if (state.status !== "ready") return "";
+    return state.items.map((item) => item.id).join(",");
+  }, [state]);
 
   useEffect(() => {
     let cancelled = false;
+
+    const key = `${tab}:1`;
     (async () => {
-      const all = await db.identities.toArray();
+      const cached = await getRawgListRow(key);
       if (cancelled) return;
-      const set = new Set<number>();
-      all.forEach((ident) => {
-        if (typeof ident.rawgId === "number") {
-          set.add(ident.rawgId);
+
+      if (cached && !isRawgListStale(cached)) {
+        setState({ status: "ready", items: cached.items, fetchedAt: cached.fetchedAtISO });
+        return;
+      }
+
+      setState((prev) => ({ status: "loading", items: prev.items }));
+      try {
+        const response = await FETCHERS[tab](1);
+        const results = Array.isArray(response?.results) ? response.results : [];
+        const items = results.slice(0, 24).map(mapResultToItem);
+        const row = {
+          key,
+          page: 1,
+          items,
+          fetchedAtISO: new Date().toISOString(),
+        };
+        await upsertRawgListRow(row);
+        void pruneRawgLists();
+        if (!cancelled) {
+          setState({ status: "ready", items, fetchedAt: row.fetchedAtISO });
+        }
+      } catch (error: any) {
+        if (!cancelled) {
+          setState((prev) => ({
+            status: "error",
+            items: prev.items,
+            message: error?.message ?? "Failed to load RAWG list.",
+          }));
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [tab]);
+
+  useEffect(() => {
+    if (state.status !== "ready") {
+      setIdentityMap(new Map());
+      return;
+    }
+
+    const ids = state.items.map((item) => item.id);
+    if (!ids.length) {
+      setIdentityMap(new Map());
+      return;
+    }
+
+    let cancelled = false;
+    (async () => {
+      const identities = await db.identities.where("rawgId").anyOf(ids).toArray();
+      if (cancelled) return;
+      const map: IdentityMap = new Map();
+      identities.forEach((identity) => {
+        if (typeof identity.rawgId === "number") {
+          map.set(identity.rawgId, identity.id);
         }
       });
-      setExistingRawgIds(set);
+      setIdentityMap(map);
     })();
+
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [readyKey, state.status]);
 
   useEffect(() => {
-    if (!toast) return;
-    const timer = window.setTimeout(() => setToast(null), 4000);
-    return () => window.clearTimeout(timer);
-  }, [toast]);
+    if (!notice) return;
+    const timer = setTimeout(() => setNotice(null), notice.kind === "error" ? 5000 : 3000);
+    return () => clearTimeout(timer);
+  }, [notice]);
 
-  const markRawgId = useCallback((rawgId?: number) => {
-    if (typeof rawgId !== "number") return;
-    setExistingRawgIds((prev) => {
-      if (prev.has(rawgId)) return prev;
-      const next = new Set(prev);
-      next.add(rawgId);
-      return next;
-    });
-  }, []);
+  const fetchedLabel = useMemo(() => {
+    if (state.status !== "ready") return null;
+    const date = new Date(state.fetchedAt);
+    if (Number.isNaN(date.getTime())) return null;
+    return date.toLocaleString();
+  }, [state]);
 
-  const ensureIdentityForResult = useCallback(
-    async (
-      result: RawgExploreResult,
-      opts?: { createLibrary?: boolean },
-    ): Promise<{ identity: Identity; library?: LibraryItem; createdLibrary: boolean }> => {
-      let identity =
-        (await db.identities
-          .filter((ident) => {
-            if (typeof result.id === "number" && ident.rawgId === result.id) return true;
-            if (result.slug && ident.rawgSlug === result.slug) return true;
-            return false;
-          })
-          .first()) ?? null;
-
-      if (!identity) {
-        const identityId = `rawg-${result.id ?? nanoid()}`;
-        identity = {
-          id: identityId,
-          title: result.name,
-          platform: canonicalPlatform(result.platforms[0] ?? undefined),
-          rawgId: typeof result.id === "number" ? result.id : null,
-          rawgSlug: result.slug ?? null,
-          mcScore: result.metacritic ?? null,
-          ocScore: result.rating != null ? Math.round(result.rating * 20) : null,
-          criticScoreSource:
-            result.metacritic != null
-              ? "metacritic"
-              : result.rating != null
-                ? "rawg"
-                : undefined,
-        };
-        await db.identities.put(identity);
-      }
-
-      let library: LibraryItem | undefined = undefined;
-      let createdLibrary = false;
-      if (opts?.createLibrary) {
-        library = await db.library.where("identityId").equals(identity.id).first();
-        if (!library) {
-          library = {
-            id: nanoid(),
-            identityId: identity.id,
-            status: "Wishlist",
-            source: "rawg-explore",
-          };
-          await db.library.put(library);
-          createdLibrary = true;
-        }
-      }
-
-      markRawgId(result.id);
-      return { identity, library, createdLibrary };
-    },
-    [markRawgId],
-  );
-
-  const cacheKey = useMemo(() => `${category}::${platform}`, [category, platform]);
-
-  const getResultKey = useCallback(
-    (result: RawgExploreResult) => (result.id != null ? `id:${result.id}` : `slug:${result.slug ?? result.name}`),
-    [],
-  );
-
-  const markPendingAdd = useCallback((key: string, pending: boolean) => {
-    setPendingAddKeys((prev) => {
-      const next = new Set(prev);
-      if (pending) {
-        next.add(key);
-      } else {
-        next.delete(key);
-      }
-      return next;
-    });
-  }, []);
-
-  const isResultInLibrary = useCallback(
-    (result: RawgExploreResult) => typeof result.id === "number" && existingRawgIds.has(result.id),
-    [existingRawgIds],
-  );
-
-  const handleAddToLibrary = useCallback(
-    async (result: RawgExploreResult) => {
-      const key = getResultKey(result);
-      markPendingAdd(key, true);
+  const handleWishlistToggle = useCallback(
+    async (rawgItem: RawgListItem, targetAppId: number, steamAppId: number | null) => {
+      if (pendingWishlistAppIds.has(targetAppId)) return;
+      setPendingWishlistAppIds((prev) => {
+        const next = new Set(prev);
+        next.add(targetAppId);
+        return next;
+      });
       try {
-        const { identity, createdLibrary } = await ensureIdentityForResult(result, { createLibrary: true });
-        invalidateGameDetailsLazy(identity.id);
-        prefetchGameDetailsLazy(identity.id);
-        setDrawerId(identity.id);
-        setToast({
-          kind: "success",
-          message: createdLibrary
-            ? `${identity.title} added to your library.`
-            : `${identity.title} is already in your library.`,
-        });
-      } catch (err: any) {
-        setToast({ kind: "error", message: err?.message || "Failed to add game to your library." });
-      } finally {
-        markPendingAdd(key, false);
-      }
-    },
-    [ensureIdentityForResult, getResultKey, markPendingAdd],
-  );
-
-  const handleViewDetails = useCallback(
-    async (result: RawgExploreResult) => {
-      const key = getResultKey(result);
-      setViewLoadingKey(key);
-      try {
-        const { identity } = await ensureIdentityForResult(result);
-        prefetchGameDetailsLazy(identity.id);
-        setDrawerId(identity.id);
-      } catch (err: any) {
-        setToast({ kind: "error", message: err?.message || "Unable to load RAWG details." });
-      } finally {
-        setViewLoadingKey((current) => (current === key ? null : current));
-      }
-    },
-    [ensureIdentityForResult, getResultKey],
-  );
-
-  useEffect(() => {
-    let cancelled = false;
-    setState((prev) => ({ status: "loading", data: prev.data }));
-
-    (async () => {
-      try {
-        const cached = await getRawgExploreRow(cacheKey);
-        if (!cancelled && cached && !isRawgExploreStale(cached)) {
-          setState({ status: "ready", data: cached.results, fetchedAt: cached.lastFetchedISO });
-          return;
-        }
-
-        const params = CATEGORY_CONFIG[category].buildParams(platform);
-        const json = await listGames(params);
-        const results: RawgExploreResult[] = Array.isArray(json?.results)
-          ? json.results.map((game: any) => ({
-              id: game?.id ?? 0,
-              slug: game?.slug ?? "",
-              name: game?.name ?? "Untitled",
-              backgroundImage: game?.background_image ?? null,
-              rating: typeof game?.rating === "number" ? game.rating : null,
-              metacritic: typeof game?.metacritic === "number" ? game.metacritic : null,
-              released: game?.released ?? null,
-              genres: Array.isArray(game?.genres) ? game.genres.map((g: any) => g?.name).filter(Boolean) : [],
-              platforms: Array.isArray(game?.parent_platforms)
-                ? game.parent_platforms
-                    .map((p: any) => p?.platform?.name)
-                    .filter(Boolean)
-                : [],
-              stores: Array.isArray(game?.stores)
-                ? game.stores
-                    .map((s: any) => ({
-                      id: s?.store?.id,
-                      name: s?.store?.name,
-                      url: s?.url || s?.store?.domain || null,
-                      domain: s?.store?.domain ?? null,
-                    }))
-                    .filter((store: any) => Number.isFinite(store.id) && store.name)
-                : [],
-            }))
-          : [];
-
-        const row = {
-          key: cacheKey,
-          results,
-          lastFetchedISO: new Date().toISOString(),
-        };
-        await upsertRawgExploreRow(row);
-        if (!cancelled) {
-          setState({ status: "ready", data: results, fetchedAt: row.lastFetchedISO });
-        }
-      } catch (err: any) {
-        if (!cancelled) {
-          setState({
-            status: "error",
-            message: err?.message || "RAWG explore fetch failed.",
-            data: [],
+        if (manualWishlistAppIds.has(targetAppId)) {
+          await removeWishlistItem(targetAppId, WISHLIST_SOURCE_USER);
+        } else {
+          await addWishlistItem({
+            appid: targetAppId,
+            title: rawgItem.title,
+            platform: rawgItem.platforms[0] ?? null,
+            currency: null,
+            initial: null,
+            final: null,
+            discountPercent: null,
+            saleEndISO: null,
           });
+          if (steamAppId == null) {
+            setNotice({
+              kind: "info",
+              message: "Saved to wishlist (manual entry). Link a Steam app id later to track prices.",
+            });
+          }
         }
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : typeof err === "string" ? err : "Wishlist update failed.";
+        setNotice({ kind: "error", message });
+      } finally {
+        setPendingWishlistAppIds((prev) => {
+          const next = new Set(prev);
+          next.delete(targetAppId);
+          return next;
+        });
+        void refreshWishlist();
       }
-    })();
+    },
+    [manualWishlistAppIds, pendingWishlistAppIds, refreshWishlist],
+  );
 
-    return () => {
-      cancelled = true;
-    };
-  }, [cacheKey, category, platform]);
-
-  const activeConfig = CATEGORY_CONFIG[category];
-  const isLoading = state.status === "loading";
+  const items = state.status === "ready" ? state.items : state.items ?? [];
 
   return (
-    <>
-      {toast ? (
-        <div
-          className={clsx(
-            "fixed bottom-4 right-4 z-50 rounded-2xl px-4 py-3 text-sm shadow-lg",
-            toast.kind === "success" ? "bg-emerald-600 text-white" : "bg-rose-600 text-white",
-          )}
-        >
-          {toast.message}
+    <div className="space-y-6">
+      <header className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <h1 className="text-2xl font-semibold text-zinc-900">Explore Games</h1>
+          <p className="text-sm text-zinc-500">{TAB_CONFIG[tab].description}</p>
         </div>
-      ) : null}
-
-      <div className="space-y-6">
-        <header className="rounded-3xl border border-emerald-100 bg-white p-4 shadow-sm sm:flex sm:items-center sm:justify-between">
-          <div>
-            <h1 className="text-xl font-semibold text-zinc-900">Explore games</h1>
-            <p className="text-sm text-zinc-500">{activeConfig.description}</p>
-        </div>
-        <div className="mt-3 flex flex-wrap items-center gap-2 sm:mt-0">
-          {(Object.keys(CATEGORY_CONFIG) as CategoryKey[]).map((key) => (
+        <div className="flex flex-wrap items-center gap-2">
+          {(Object.keys(TAB_CONFIG) as TabKey[]).map((key) => (
             <button
               key={key}
               type="button"
-              onClick={() => setCategory(key)}
               className={clsx(
-                "rounded-full px-3 py-1 text-sm font-semibold transition",
-                category === key ? "bg-emerald-600 text-white" : "bg-emerald-50 text-emerald-700 hover:bg-emerald-100",
+                "rounded-full px-4 py-1.5 text-sm font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500",
+                key === tab
+                  ? "bg-emerald-600 text-white shadow-sm"
+                  : "bg-white text-emerald-600 hover:bg-emerald-50 border border-emerald-100",
               )}
+              onClick={() => {
+                setExpandedIdentityId(null);
+                setTab(key);
+              }}
             >
-              {CATEGORY_CONFIG[key].label}
+              {TAB_CONFIG[key].label}
             </button>
           ))}
-          <select
-            className="select text-sm"
-            value={platform}
-            onChange={(event) => setPlatform(event.target.value as PlatformKey)}
-            aria-label="Filter by platform"
-          >
-            <option value="all">All platforms</option>
-            <option value="pc">PC</option>
-            <option value="playstation">PlayStation</option>
-            <option value="xbox">Xbox</option>
-            <option value="nintendo">Nintendo</option>
-          </select>
         </div>
       </header>
+
+      {notice ? (
+        <div
+          className={clsx(
+            "rounded-2xl border px-4 py-3 text-sm",
+            notice.kind === "error"
+              ? "border-rose-200 bg-rose-50 text-rose-700"
+              : "border-emerald-200 bg-emerald-50 text-emerald-700",
+          )}
+        >
+          {notice.message}
+        </div>
+      ) : null}
 
       {state.status === "error" ? (
         <div className="rounded-3xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700">
@@ -393,155 +317,156 @@ export default function ExplorePage() {
         </div>
       ) : null}
 
-      <section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-        {isLoading
-          ? Array.from({ length: 12 }).map((_, index) => (
-              <div
-                key={`skeleton-${index}`}
-                className="h-64 animate-pulse rounded-3xl border border-zinc-100 bg-zinc-100/80"
-              />
-            ))
-          : state.data.map((item, index) => {
-              const key = getResultKey(item);
-              return (
-                <ExploreCard
-                  key={item.id || `${item.slug}-${index}`}
-                  data={item}
-                  onView={() => handleViewDetails(item)}
-                  onAdd={() => handleAddToLibrary(item)}
-                  viewing={viewLoadingKey === key}
-                  adding={pendingAddKeys.has(key)}
-                  inLibrary={isResultInLibrary(item)}
-                />
-              );
-            })}
-      </section>
-
-      {state.status === "ready" && !state.data.length ? (
-        <div className="rounded-3xl border border-zinc-200 bg-white p-6 text-sm text-zinc-500 text-center">
-          No games found. Try a different platform or category.
-        </div>
-      ) : null}
-      </div>
-
-      <Drawer open={drawerId != null} onClose={() => setDrawerId(null)}>
-        {drawerId ? (
-          <Suspense fallback={<div className="p-4 text-sm text-zinc-500">Loading game details...</div>}>
-            <GameDetails identityId={drawerId} />
-          </Suspense>
-        ) : null}
-      </Drawer>
-    </>
-  );
-}
-
-function ExploreCard({
-  data,
-  onView,
-  onAdd,
-  viewing,
-  adding,
-  inLibrary,
-}: {
-  data: RawgExploreResult;
-  onView: () => void;
-  onAdd: () => void;
-  viewing: boolean;
-  adding: boolean;
-  inLibrary: boolean;
-}) {
-  const releaseLabel = data.released ? formatDateDisplay(data.released) : "TBA";
-  const ratingLabel =
-    data.metacritic != null ? `MC ${data.metacritic}` : data.rating != null ? `RAWG ${(data.rating * 20).toFixed(0)}` : null;
-  const topStores = (data.stores ?? []).slice(0, 3);
-
-  return (
-    <article className="flex h-full flex-col overflow-hidden rounded-3xl border border-zinc-100 bg-white shadow-sm transition hover:-translate-y-0.5 hover:shadow-md">
-      <div className="relative aspect-[16/10] overflow-hidden bg-zinc-200">
-        {data.backgroundImage ? (
-          <img src={data.backgroundImage} alt="" className="h-full w-full object-cover" loading="lazy" />
-        ) : null}
-      </div>
-      <div className="flex flex-1 flex-col gap-2 p-4">
-        <div className="flex items-start justify-between gap-2">
-          <div className="text-sm font-semibold text-zinc-900 line-clamp-2">{data.name}</div>
-          {ratingLabel ? (
-            <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-600">
-              {ratingLabel}
-            </span>
-          ) : null}
-        </div>
-        <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
-          <span className="rounded-full border border-zinc-200 px-2 py-0.5">Release {releaseLabel}</span>
-          {data.platforms.slice(0, 3).map((platform) => (
-            <span key={platform} className="rounded-full border border-zinc-200 px-2 py-0.5">
-              {platform}
-            </span>
+      {state.status === "loading" && !items.length ? (
+        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+          {Array.from({ length: 6 }).map((_, index) => (
+            <div key={index} className="space-y-3 rounded-3xl border border-zinc-100 bg-white p-4 shadow-sm">
+              <div className="aspect-[16/10] rounded-2xl bg-zinc-200 animate-pulse" />
+              <div className="h-4 w-2/3 rounded bg-zinc-200 animate-pulse" />
+              <div className="h-3 w-1/2 rounded bg-zinc-200 animate-pulse" />
+            </div>
           ))}
         </div>
-        {topStores.length ? (
-          <div className="mt-auto flex flex-wrap gap-2 text-xs text-emerald-600">
-            {topStores.map((store) => {
-              const info = getStoreInfo(store.id) ?? { name: store.name };
-              return (
-                <span
-                  key={`${store.id}-${store.name}`}
-                  className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-0.5 font-semibold"
-                  title={info.name}
+      ) : (
+        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+          {items.map((item) => {
+            const identityId = identityMap.get(item.id) ?? null;
+            const isExpanded = identityId != null && expandedIdentityId === identityId;
+            const steamAppId = extractSteamAppId(item.stores);
+            const manualAppId = steamAppId ?? fallbackManualAppId(item.id);
+            const manualWishlisted = manualWishlistAppIds.has(manualAppId);
+            const anyWishlisted =
+              steamAppId != null ? allWishlistAppIds.has(steamAppId) || manualWishlisted : manualWishlisted;
+            const pendingWishlist = pendingWishlistAppIds.has(manualAppId);
+            const wishlistLabel = pendingWishlist
+              ? "Saving..."
+              : manualWishlisted
+                ? "Wishlisted"
+                : anyWishlisted
+                  ? "On Steam"
+                  : "Wishlist";
+            const buttonDisabled =
+              pendingWishlist || (steamAppId != null && !manualWishlisted && allWishlistAppIds.has(steamAppId));
+            const wishlistTooltip = pendingWishlist
+              ? "Saving entry..."
+              : steamAppId == null
+                ? manualWishlisted
+                  ? "Remove from wishlist"
+                  : "Save as a manual wishlist entry"
+                : !manualWishlisted && allWishlistAppIds.has(steamAppId)
+                  ? "Already on your Steam wishlist."
+                  : manualWishlisted
+                    ? "Remove manual wishlist entry"
+                    : "Add to wishlist";
+            return (
+              <div key={`${item.id}-${item.slug}`} className="relative space-y-3">
+                <article
+                  className="group flex h-full cursor-pointer flex-col overflow-hidden rounded-3xl border border-zinc-100 bg-white shadow-sm transition hover:-translate-y-0.5 hover:shadow-md focus-within:outline-none focus-within:ring-2 focus-within:ring-emerald-500"
+                  onClick={() => {
+                    if (identityId) {
+                      setExpandedIdentityId((prev) => (prev === identityId ? null : identityId));
+                    } else {
+                      setNotice({
+                        kind: "info",
+                        message: "Add this game to your library to view full details.",
+                      });
+                    }
+                  }}
+                  onMouseEnter={() => {
+                    if (identityId) {
+                      prefetchGameDetailsLazy(identityId);
+                    }
+                  }}
                 >
-                  <span className="text-[11px] uppercase">{info.icon ?? info.name.slice(0, 2)}</span>
-                  <span className="hidden sm:inline">{info.name}</span>
-                </span>
-              );
-            })}
-          </div>
-        ) : null}
-        <div className="mt-2 flex justify-between text-xs text-emerald-600">
-          <span>{data.genres.slice(0, 2).join(", ")}</span>
-          <a
-            href={`https://rawg.io/games/${data.slug}`}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="font-semibold hover:underline"
-          >
-            RAWG
-          </a>
+                  <div className="relative aspect-[16/10] overflow-hidden bg-zinc-200">
+                    {item.backgroundImage ? (
+                      <img
+                        src={item.backgroundImage}
+                        alt=""
+                        className="h-full w-full object-cover transition duration-200 group-hover:scale-[1.02]"
+                        loading="lazy"
+                      />
+                    ) : (
+                      <div className="flex h-full w-full items-center justify-center text-xs text-zinc-500">
+                        No artwork
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex flex-1 flex-col gap-2 p-4">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="text-sm font-semibold text-zinc-900 line-clamp-2">{item.title}</div>
+                      <div className="flex flex-col items-end gap-2">
+                        {item.metacritic != null ? (
+                          <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-600">
+                            MC {item.metacritic}
+                          </span>
+                        ) : null}
+                        <button
+                          type="button"
+                          className={clsx(
+                            "rounded-full px-3 py-1 text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500",
+                            manualWishlisted
+                              ? "bg-emerald-600 text-white"
+                              : !manualWishlisted && anyWishlisted
+                                ? "border border-emerald-200 bg-emerald-50 text-emerald-700"
+                                : "border border-zinc-200 bg-white text-zinc-600 hover:border-emerald-200 hover:text-emerald-600",
+                            pendingWishlist ? "opacity-60" : "",
+                          )}
+                          disabled={buttonDisabled}
+                          title={wishlistTooltip}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            if (buttonDisabled) return;
+                            void handleWishlistToggle(item, manualAppId, steamAppId);
+                          }}
+                        >
+                          {wishlistLabel}
+                        </button>
+                      </div>
+                    </div>
+                    {item.genres.length ? (
+                      <div className="flex flex-wrap gap-1 text-xs text-zinc-500">
+                        {item.genres.slice(0, 3).map((genre) => (
+                          <span key={genre} className="rounded-full border border-zinc-200 px-2 py-0.5">
+                            {genre}
+                          </span>
+                        ))}
+                      </div>
+                    ) : null}
+                    <div className="mt-auto flex justify-between text-xs text-emerald-600">
+                      <span>{identityId ? "In library" : "RAWG spotlight"}</span>
+                      <a
+                        href={`https://rawg.io/games/${item.slug}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="font-semibold hover:underline"
+                        onClick={(event) => event.stopPropagation()}
+                      >
+                        View RAWG
+                      </a>
+                    </div>
+                  </div>
+                </article>
+                {isExpanded ? (
+                  <div className="col-span-full rounded-3xl border border-zinc-200 bg-white p-4 shadow-inner sm:p-6">
+                    <Suspense fallback={<div className="text-sm text-zinc-500">Loading details...</div>}>
+                      <GameDetails identityId={identityId} />
+                    </Suspense>
+                  </div>
+                ) : null}
+              </div>
+            );
+          })}
         </div>
-        <div className="mt-3 flex flex-col gap-2 sm:flex-row">
-          <button
-            type="button"
-            onClick={onView}
-            className="btn flex-1"
-            disabled={viewing}
-          >
-            {viewing ? "Opening..." : "View details"}
-          </button>
-          <button
-            type="button"
-            onClick={onAdd}
-            className="btn-ghost flex-1 sm:flex-none sm:min-w-[8rem]"
-            disabled={adding || inLibrary}
-          >
-            {inLibrary ? "In library" : adding ? "Adding..." : "Add to library"}
-          </button>
+      )}
+
+      {state.status === "ready" && !items.length ? (
+        <div className="rounded-3xl border border-zinc-200 bg-white p-6 text-center text-sm text-zinc-500">
+          No games matched this view yet. Try another tab soon.
         </div>
-      </div>
-    </article>
+      ) : null}
+
+      {fetchedLabel ? <div className="text-xs text-zinc-400">Last updated {fetchedLabel}</div> : null}
+    </div>
   );
-}
-
-function addDays(date: Date, days: number): Date {
-  const next = new Date(date);
-  next.setDate(next.getDate() + days);
-  return next;
-}
-
-function formatDateForQuery(date: Date): string {
-  return date.toISOString().slice(0, 10);
-}
-
-function formatDateDisplay(iso: string): string {
-  const date = new Date(iso);
-  if (Number.isNaN(date.getTime())) return "TBA";
-  return date.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
 }

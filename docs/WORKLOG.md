@@ -170,3 +170,103 @@ Acceptance checklist
 - Library cards surface Steam playtime chips (total hours, last two weeks, last played date) once personal data is fetched; a `gt:library-reload` custom event keeps grids in sync after desktop syncs.
 - Drawer "Your data" card highlights library status, price/value, and Steam history ahead of the tabset so personal metrics are visible without scrolling.
 - Validation (2025-03-03): `pnpm -C apps/web typecheck` (pass), `pnpm -C apps/web build` (pass; main chunk 769.69 kB gz 223.60 kB, warning acknowledged), `cargo check` (apps/desktop/src-tauri, pass with existing warnings on `_threshold_high` and `PlayerStatsRaw.error`).
+
+## 2025-10-29 - AI suggestions panel & drawer hook
+### AI Suggestions (Batch 4)
+- Added Ally client helpers (`apps/web/src/ally/aiClient.ts`, `apps/web/src/ally/buildCandidates.ts`) to package heuristically ranked Library rows into `AICandidate[]`, enforce a 50-candidate cap, and fall back to heuristics when Ally returns non-JSON.
+- `apps/web/src/pages/SuggestionsPage.tsx` now exposes a desktop-only AI panel: quick chips, custom prompt box, and local-only toggle (default). Knobs persist to Dexie (`suggest.aiMode`, `suggest.aiAllowWeb`, `suggest.aiTimebox`, `suggest.aiQuery`) with a 300 ms debounce.
+- Rank requests respect the existing 1 request/second Ally bridge guard and reuse heuristic data; `sessionStorage` hand-off (`suggest.pendingAsk`) primes prompts from other screens.
+- Game drawer footer (`apps/web/src/components/details/GameDetails.tsx`) includes an "Ask AI about this game" action that stashes a coach-mode prompt and routes to the Suggestions page without collapsing the card (click/key events stop propagation).
+- Default behaviour keeps Ally offline (local-only). Web fallback must be explicitly toggled. Candidate payload remains capped to 50 entries per request to keep latency predictable.
+
+### Acceptance checklist
+- Desktop Suggestions page shows AI panel with chips, toggles, persisted values, and guard text when Ally sidecar is missing.
+- Quick chips ("Under 30 min", "Co-op tonight", "Deals > 50%") populate fields and trigger Ally; ranked list renders with `#rank`, AI badge, reason tooltip, and heuristic tags.
+- Drawer footer button opens Suggestions view, pre-fills "Should I play <game> next? Explain briefly." prompt, and immediately triggers the AI panel.
+- When Ally returns malformed JSON or no results, the UI surfaces an inline error block or empty-state card without breaking the heuristics tab.
+
+### Validation
+- `pnpm -C apps/web typecheck`
+- `pnpm -C apps/web build` (Vite main chunk warning acknowledged)
+
+## 2025-10-30 - Ally automations (Batch 5)
+### Nightly export/embed/start + daily digest
+- Introduced Ally runbook helpers (`apps/web/src/ally/runbook.ts`) so web code can trigger the full Export -> Embed -> Start pipeline or a chat digest with consistent logging.
+- Dexie v15 adds `allyDigests`, `allyLogs`, and a canonical `ally-automation` settings record (defaults: export at 22:30, digest at 09:00, disabled). Helpers `getAutomationSettings`/`saveAutomationSettings` provide normalized access, while `addDigest`, `getRecentDigests`, and `appendAllyLog` manage capped history (50 digests, 500 logs).
+- New automation loop (`apps/web/src/ally/automation.ts`) runs on desktop only, respecting per-day guards, 1 req/s budgeting, and logging success/failure. It queues Export -> Embed -> Start when the nightly time passes and emits Markdown digests (coach/deals/both) each morning, persisting status to Dexie.
+- Settings → AI / Ally gains an Automations panel: master toggle, HH:mm pickers, digest scope/allow-web controls, "Run Export->Embed->Start now" button, and a collapsible log viewer with refresh/clear actions.
+- Added `AllyDigestCard` component (desktop-only) that shows the last 7 digests, surfaces Markdown (stored as pre text for now), and lets users run a digest on demand. Manual runs update automation timestamps and append log entries.
+- `apps/web/src/ally/log.ts` funnels structured log entries into Dexie and re-exports convenience getters for UI.
+- Replaced the old `maybeNightlyExport` shim by wiring `startAllyAutomationLoop()` in `App.tsx` (idle-started). Removed the legacy `ally/scheduler.ts`.
+
+### Desktop bridge hardening
+- `apps/desktop/src-tauri/src/ally.rs` now prints command previews when launch fails (path + args + io::Error) and annotates file-system errors with the data dir/file path, easing troubleshooting when the Python binary is missing.
+
+### Acceptance checklist
+- Enable automations in Settings, set export/digest times a minute out, and observe that Export -> Embed -> Start runs once per local day with log entries and updated timestamps.
+- Manually run a digest; confirm a new row appears with status pill, content expands, and logs include a success or failure entry. Toggle "Digest can use web" to verify the loop handles allow-web safely.
+- Log viewer shows most recent entries first, allows refresh/clear, and remains desktop-only.
+
+### Validation
+- `cargo check` (apps/desktop/src-tauri)
+- `pnpm -C apps/web typecheck`
+- `pnpm -C apps/web build`
+
+## 2025-10-30 - AI reliability & insights (Batch 6)
+- Core package now exports Ally helpers (`packages/core/src/ally/prompts.ts`, `schema.ts`, `repair.ts`, `features.ts`) wrapped with zod validation so callers get strict JSON (single critic score + single TTB) and a safe `extractJsonBlock` fallback.
+- Web AI client (`apps/web/src/ally/aiClient.ts`) consumes those helpers: 50-candidate cap, JSON repair warnings, charts/notes handling, and optional transcript writes (`saveTranscript`). Candidate builder adds derived features via `computeFeatures`.
+- Added presentation components for Ally insights: `ChartsBlock` + lazy `LineChart` SVG renderer, dev-only `TranscriptPanel`, and `AllyDigestCard` for manual digest runs.
+- AI panel now surfaces a warning banner when JSON repair kicks in, gates the dev transcript panel behind `VITE_DEV_INSPECTOR`, and reacts immediately to the Settings toggle via the `ally:transcripts-toggle` event.
+- Dexie schema (`apps/web/src/db.ts`) gains `allyTranscripts`, `allyLogs`, and helpers (`appendAllyLog`, `getTranscripts`, `saveTranscript`). Settings AI/Ally section now exposes digest card, automation toggles, log viewer, transcript toggle/clear, and data-dir/timestamp badges (`apps/web/src/pages/SettingsPage.tsx`).
+- Suggestions page (`apps/web/src/pages/SuggestionsPage.tsx`) anchors the AI panel (`#ai`), prefetches on hover, and renders optional charts behind "View insights".
+- Automation loop rebuilt in `apps/web/src/ally/automation.ts` with ASCII-safe prompts, digest persistence, log hooks, and idle start from `apps/web/src/ui/App.tsx`.
+- Added local declarations for `unidecode` (`packages/core/src/types/unidecode.d.ts`, `apps/web/src/types/unidecode.d.ts`) so both core and web builds type-check without ambient anys.
+
+### Acceptance
+- Ally replies that pass schema render ranked rows, optional notes, and lazy chart insight blocks; malformed replies surface a warning and deterministic fallback list.
+- Settings -> AI / Ally shows digest history, automation scheduler (time pickers, scope/allow-web toggle, run buttons), transcript switch, and structured log viewer with refresh/clear.
+- Dev transcript panel reflects the toggle immediately; `sessionStorage` hand-off from GameDetails opens Suggestions at `#ai` and triggers the queued prompt.
+
+### Validation
+- `pnpm -C packages/core build`
+- `pnpm -C apps/web typecheck`
+- `pnpm -C apps/web build` (Vite large chunk warning acknowledged)
+
+## 2025-10-31 - Dexie caches & planner wiring (Batch 7)
+- Dexie bumped to v15: dropped legacy `rawgExplore` in favour of `rawgLists`, added `wishlists`, `allyDigests`, `allyLogs`, `allyTranscripts`, and `plans` tables, plus compound indexes for `steamPrices` (`[appid+lastFetchedISO]`) and `sessions` (`[identityId+startedAt]`). Added capped helpers for wishlist upserts, digest/log history, transcripts, automation settings, and session exe-map toggles; perf logging switch now respects the persisted `dev.logPerf` flag.
+- RAWG list helpers exposed via `getRawgListRow`/`upsertRawgListRow`/`pruneRawgLists` (30‑day TTL). Explore page maps RAWG genres/platforms/stores into `RawgListItem`, prefetches details, and honours cached rows before issuing API requests.
+- Finish planner persistence: new Dexie `plans` table with `savePlan`, `getPlanForIdentity`, and `updatePlan` ensures inline planner UI can build/refresh/toggle steps while tracking `doneCount` and timestamps.
+- Session bridge stores both session id and resolved `identityId`, updating subscribers whenever the active window changes; exe cache persists via Dexie settings.
+- Ally automation/logging APIs restored for downstream callers (`getAutomationSettings`, `appendAllyLog`, `getRecentDigests`, `saveTranscript`) so Settings/Ally UI and automation loops compile again. Steam wishlist import now lands in Dexie via `upsertWishlist`.
+
+### Validation
+- `pnpm -C packages/core build`
+- `pnpm -C packages/core test`
+- `pnpm -C apps/web typecheck`
+- `pnpm -C apps/web build` (Vite main chunk warning noted)
+- `cargo check` (apps/desktop/src-tauri, warnings only)
+
+## 2025-11-01 - Desktop updater & diagnostics
+- Switched to the Tauri updater plugin: added placeholder endpoint/pubkey in `tauri.conf.json`, bundle now exposes platform Ally binaries, and the CLI auto-checks for updates once a week on desktop startup (persisting status in Dexie settings).
+- Settings page gains an “Updates” card (manual check + install via plugin-updater) and a desktop-only “Export diagnostics (zip)” action that zips Ally logs/digests/settings + 50-line console buffer through the new `pack_diagnostics_cmd`.
+- Added lightweight console proxy (`utils/consoleBuffer`) to retain recent log output and wired Pack Diagnostics bridge; backend command writes archives under the cache directory with bundle/platform metadata.
+- Ally runtime now resolves per-platform binaries (`bin/ally/win|mac|linux`) with fallback to the legacy Python entry point if a bundled binary is missing; `.env` overrides remain supported.
+
+### Validation
+- `pnpm -C apps/web typecheck`
+- `pnpm -C apps/web build` (Vite chunk warning acknowledged)
+- `cargo check` (desktop target; existing warnings for unused `steam.rs`/`sessions.rs` fields)
+
+## 2025-11-01 - Test automation & CI
+- Added Playwright smoke suite (`apps/web/tests/smoke.spec.ts`) with Chromium config and webserver bootstrapping (`apps/web/playwright.config.ts`); navigation covers Library/Explore/Deals/Suggestions with a mocked desktop bridge.
+- Root scripts now expose `pnpm test` (workspace tests + Playwright) and `pnpm test:unit`, enabling the new GitHub Actions workflow (`.github/workflows/ci.yml`) that runs install/build/test and uploads the Vite dist; tags trigger a Tauri build job.
+- Core package gains targeted vitest coverage for planner math, deal scoring, and Ally JSON parsing (`packages/core/src/__tests__/*`).
+- Stubbed `/deals` page to keep navigation intact and added the nav link in `App.tsx`.
+- Introduced console buffer helper + diagnostics bridge wiring leveraged by the Settings diagnostics exporter.
+
+### Validation
+- `pnpm -C packages/core test`
+- `pnpm -C apps/web typecheck`
+- `pnpm -C apps/web build`
+- `pnpm -C apps/web test:e2e`
+- `cargo check`

@@ -1,6 +1,6 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
-use reqwest::blocking::Client;
+use reqwest::{blocking::Client, StatusCode};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -125,6 +125,20 @@ pub struct Price {
   pub final_: i32,
   pub discount_percent: i32,
   pub last_fetched_iso: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct WishlistRow {
+  pub appid: u32,
+  pub title: String,
+  pub added_at_iso: Option<String>,
+  pub priority: Option<i32>,
+  pub currency: Option<String>,
+  pub initial: Option<i32>,
+  #[serde(rename = "final")]
+  pub final_price: Option<i32>,
+  pub discount_percent: Option<i32>,
+  pub sale_end_iso: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -278,6 +292,18 @@ fn throttle(domain: &'static str) {
   guard.insert(domain, Instant::now());
 }
 
+fn fallback_app_title(appid: u32) -> String {
+  format!("App {appid}")
+}
+
+fn iso_from_timestamp(value: i64) -> Option<String> {
+  if value <= 0 {
+    return None;
+  }
+  let seconds = if value > 10_000_000_000 { value / 1_000 } else { value };
+  DateTime::<Utc>::from_timestamp(seconds, 0).map(|dt| dt.to_rfc3339())
+}
+
 fn api_get<T: DeserializeOwned>(path: &str, query: &[(&str, String)]) -> SteamResult<T> {
   throttle(API_HOST);
   let response = CLIENT
@@ -286,6 +312,190 @@ fn api_get<T: DeserializeOwned>(path: &str, query: &[(&str, String)]) -> SteamRe
     .send()?
     .error_for_status()?;
   response.json().map_err(|e| SteamError::Parse(e.to_string()))
+}
+
+fn wishlist_from_api(steamid: &str, region: &str, language: &str) -> SteamResult<Vec<WishlistRow>> {
+  let key = steam_api_key()?;
+  let mut rows: Vec<WishlistRow> = Vec::new();
+  let mut page = 0;
+
+  loop {
+    let resp: Value = api_get(
+      "IWishlistService/GetWishlist/v1/",
+      &[
+        ("key", key.clone()),
+        ("steamid", steamid.to_string()),
+        ("page", page.to_string()),
+        ("num_per_page", "200".to_string()),
+        ("language", language.to_string()),
+        ("cc", region.to_string()),
+      ],
+    )?;
+
+    let response = resp
+      .get("response")
+      .and_then(|v| v.as_object())
+      .ok_or_else(|| SteamError::Parse("Wishlist API response missing 'response' object.".into()))?;
+
+    if let Some(message) = response
+      .get("message")
+      .and_then(|v| v.as_str())
+      .filter(|msg| !msg.is_empty())
+      .filter(|_| page == 0)
+    {
+      return Err(SteamError::Http(format!("Steam wishlist API: {message}")));
+    }
+
+    let items = response
+      .get("items")
+      .or_else(|| response.get("wishlist"))
+      .and_then(|v| v.as_array())
+      .cloned()
+      .unwrap_or_default();
+
+    if items.is_empty() {
+      break;
+    }
+
+    for item in items {
+      if let Some(row) = map_wishlist_api_item(&item, region) {
+        rows.push(row);
+      }
+    }
+
+    let more_items = response
+      .get("more_items")
+      .and_then(|v| v.as_bool())
+      .or_else(|| response.get("more_items").and_then(|v| v.as_i64()).map(|n| n != 0))
+      .unwrap_or(false);
+
+    if !more_items {
+      break;
+    }
+
+    page += 1;
+    if page > 20 {
+      break;
+    }
+  }
+
+  Ok(rows)
+}
+
+fn map_wishlist_api_item(item: &Value, fallback_currency: &str) -> Option<WishlistRow> {
+  let appid = item.get("appid").and_then(|v| v.as_u64()).map(|v| v as u32)?;
+  let store_item = item.get("store_item").and_then(|v| v.as_object());
+  let raw_title = item
+    .get("name")
+    .and_then(|v| v.as_str())
+    .or_else(|| {
+      store_item
+        .and_then(|si| si.get("name").or_else(|| si.get("localized_name")))
+        .and_then(|v| v.as_str())
+    })
+    .unwrap_or("");
+  let mut title = if raw_title.trim().is_empty() || raw_title == "App" || raw_title == "Unknown App" {
+    fallback_app_title(appid)
+  } else {
+    raw_title.to_string()
+  };
+  if raw_title.trim().is_empty() || raw_title == "App" || raw_title == "Unknown App" {
+    if let Ok(Some(details)) = get_app_details(appid) {
+      if !details.name.trim().is_empty() && details.name != "Unknown App" {
+        title = details.name.clone();
+      }
+    }
+  }
+
+  let added_at_iso = item
+    .get("added")
+    .and_then(|v| v.as_i64())
+    .and_then(iso_from_timestamp);
+
+  let priority = item
+    .get("priority")
+    .and_then(|v| v.as_i64())
+    .and_then(|v| i32::try_from(v).ok());
+
+  let price_obj_primary = item
+    .get("price")
+    .or_else(|| item.get("pricing"))
+    .and_then(|v| v.as_object());
+  let price_obj_secondary = store_item
+    .and_then(|si| {
+      si.get("best_purchase_option")
+        .or_else(|| si.get("price_overview"))
+        .or_else(|| {
+          si.get("purchase_options")
+            .and_then(|opts| opts.as_array())
+            .and_then(|arr| arr.first())
+        })
+        .and_then(|v| v.as_object())
+    });
+  let price_obj = price_obj_primary.or(price_obj_secondary);
+
+  let mut currency = price_obj
+    .and_then(|price| {
+      price
+        .get("currency")
+        .or_else(|| price.get("formatted_currency"))
+        .or_else(|| price.get("currency_code"))
+    })
+    .and_then(|v| v.as_str())
+    .map(|s| s.to_uppercase());
+
+  let initial = price_obj
+    .and_then(|price| {
+      price
+        .get("initial")
+        .or_else(|| price.get("base"))
+        .or_else(|| price.get("initial_price"))
+        .or_else(|| price.get("original_price_in_cents"))
+    })
+    .and_then(|v| v.as_i64())
+    .and_then(|v| i32::try_from(v).ok());
+
+  let final_price = price_obj
+    .and_then(|price| {
+      price
+        .get("final")
+        .or_else(|| price.get("current"))
+        .or_else(|| price.get("final_price"))
+        .or_else(|| price.get("discounted_price_in_cents"))
+    })
+    .and_then(|v| v.as_i64())
+    .and_then(|v| i32::try_from(v).ok());
+
+  let discount_percent = price_obj
+    .and_then(|price| price.get("discount_percent").or_else(|| price.get("discount")))
+    .and_then(|v| v.as_i64())
+    .and_then(|v| i32::try_from(v).ok());
+
+  let sale_end_iso = price_obj
+    .and_then(|price| {
+      price
+        .get("discount_ends")
+        .or_else(|| price.get("discount_end_date"))
+        .or_else(|| price.get("discount_end_time"))
+    })
+    .and_then(|v| v.as_i64())
+    .and_then(iso_from_timestamp);
+
+  if currency.is_none() {
+    currency = Some(fallback_currency.to_uppercase());
+  }
+
+  Some(WishlistRow {
+    appid,
+    title,
+    added_at_iso,
+    priority,
+    currency,
+    initial,
+    final_price,
+    discount_percent,
+    sale_end_iso,
+  })
 }
 
 fn store_get(path: &str, query: &[(&str, String)]) -> SteamResult<Value> {
@@ -445,7 +655,7 @@ pub fn get_owned_games(steamid: &str, include_free: bool) -> SteamResult<Vec<Own
     .into_iter()
     .map(|g| OwnedGame {
       appid: g.appid,
-      name: g.name.unwrap_or_else(|| "Unknown App".into()),
+      name: g.name.unwrap_or_else(|| fallback_app_title(g.appid)),
       playtime_forever_min: g.playtime_forever.unwrap_or(0),
       playtime_2weeks_min: g.playtime_2weeks,
       rtime_last_played: g.rtime_last_played,
@@ -527,7 +737,7 @@ pub fn get_recently_played_games(steamid: &str) -> SteamResult<Vec<RecentGame>> 
     .into_iter()
     .map(|game| RecentGame {
       appid: game.appid,
-      name: game.name.unwrap_or_else(|| "Unknown App".into()),
+      name: game.name.unwrap_or_else(|| fallback_app_title(game.appid)),
       playtime_2weeks_min: game.playtime_2weeks,
       playtime_forever_min: game.playtime_forever,
       last_played: game.rtime_last_played,
@@ -601,8 +811,8 @@ fn parse_store_payload(appid: u32, cc: &str, lang: &str) -> SteamResult<(Option<
     name: data
       .get("name")
       .and_then(|v| v.as_str())
-      .unwrap_or("Unknown App")
-      .to_string(),
+      .map(|s| s.to_string())
+      .unwrap_or_else(|| fallback_app_title(appid)),
     is_free: data.get("is_free").and_then(|v| v.as_bool()).unwrap_or(false),
     header_image: data.get("header_image").and_then(|v| v.as_str()).map(|s| s.to_string()),
     capsule_image: data.get("capsule_image").and_then(|v| v.as_str()).map(|s| s.to_string()),
@@ -671,6 +881,238 @@ pub fn get_price(appid: u32) -> SteamResult<Option<Price>> {
     write_cache(&cache_name, price)?;
   }
   Ok(price)
+}
+
+pub fn get_wishlist(steamid: &str, cc: &str, lang: &str) -> SteamResult<Vec<WishlistRow>> {
+  let region = if cc.trim().is_empty() {
+    steam_cc()
+  } else {
+    cc.trim().to_string()
+  };
+  let language = if lang.trim().is_empty() {
+    steam_lang()
+  } else {
+    lang.trim().to_string()
+  };
+  let region = region.to_lowercase();
+  let language = language.to_lowercase();
+  let fallback_currency = region.to_uppercase();
+  let mut api_error: Option<SteamError> = None;
+
+  match wishlist_from_api(steamid, &region, &language) {
+    Ok(rows) => {
+      if !rows.is_empty() {
+        return Ok(rows);
+      }
+    }
+    Err(SteamError::MissingApiKey) => {}
+    Err(err) => {
+      api_error = Some(err);
+    }
+  }
+
+  let mut results = Vec::new();
+  let mut page = 0;
+
+  loop {
+    throttle(STORE_HOST);
+    let response = CLIENT
+      .get(format!(
+        "https://{STORE_HOST}/wishlist/profiles/{steamid}/wishlistdata/"
+      ))
+      .query(&[
+        ("p", page.to_string()),
+        ("cc", region.clone()),
+        ("l", language.clone()),
+      ])
+      .header("X-Requested-With", "XMLHttpRequest")
+      .header("Accept", "application/json")
+      .send()?;
+
+    match response.status() {
+      StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED => return Ok(Vec::new()),
+      StatusCode::NOT_FOUND => break,
+      StatusCode::TOO_MANY_REQUESTS => {
+        return Err(SteamError::Http("Steam wishlist rate limited. Try again in a moment.".into()))
+      }
+      status if !status.is_success() => {
+        return Err(SteamError::Http(format!(
+          "Steam wishlist request failed ({status})"
+        )))
+      }
+      _ => {}
+    }
+
+    let body = response.text()?;
+    if body.trim().is_empty() {
+      break;
+    }
+
+    if body.trim_start().starts_with('<') {
+      if let Some(err) = api_error {
+        return Err(err);
+      }
+      let lower = body.to_lowercase();
+      if lower.contains("sign in") || lower.contains("login") {
+        return Err(SteamError::Http(
+          "Steam returned a sign-in page. Open the Steam desktop client, sign in, and ensure the wishlist is public."
+            .into(),
+        ));
+      }
+      if lower.contains("wishlist is private") || lower.contains("this profile is private") {
+        return Err(SteamError::Http(
+          "Steam reports that the wishlist is private. Set it to public (Steam Store › Wishlist › Privacy Settings)."
+            .into(),
+        ));
+      }
+      return Err(SteamError::Parse(
+        "Steam returned HTML instead of JSON for wishlist. This usually means Steam blocked the request; confirm you are logged in and the wishlist is public or provide a Steam Web API key."
+          .into(),
+      ));
+    }
+
+    let value: Value = serde_json::from_str(&body).map_err(|err| {
+      let snippet = if body.len() > 240 {
+        format!("{}…", &body[..240])
+      } else {
+        body.clone()
+      };
+      SteamError::Parse(format!(
+        "Failed to decode wishlist JSON ({err}). Body starts with: {snippet}"
+      ))
+    })?;
+    let map = match value.as_object() {
+      Some(map) if !map.is_empty() => map,
+      _ => break,
+    };
+
+    let mut page_had_rows = false;
+
+    for (key, entry) in map {
+      if key == "pinnedApps" {
+        continue;
+      }
+      let appid: u32 = match key.parse() {
+        Ok(id) => id,
+        Err(_) => continue,
+      };
+      let raw_title = entry
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+      let mut title = if raw_title.trim().is_empty() || raw_title == "App" || raw_title == "Unknown App" {
+        fallback_app_title(appid)
+      } else {
+        raw_title.to_string()
+      };
+      if raw_title.trim().is_empty() || raw_title == "App" || raw_title == "Unknown App" {
+        if let Ok(Some(details)) = get_app_details(appid) {
+          if !details.name.trim().is_empty() && details.name != "Unknown App" {
+            title = details.name.clone();
+          }
+        }
+      }
+
+      let added_at_iso = entry
+        .get("added")
+        .and_then(|v| v.as_i64())
+        .and_then(iso_from_timestamp);
+
+      let priority_raw = entry
+        .get("priority")
+        .and_then(|v| v.as_i64())
+        .and_then(|v| i32::try_from(v).ok());
+      let priority = priority_raw.filter(|p| *p >= 0);
+
+      let mut initial: Option<i32> = None;
+      let mut final_price: Option<i32> = None;
+      let mut discount_percent: Option<i32> = None;
+      let mut sale_end_iso: Option<String> = None;
+      let mut currency = entry
+        .get("currency")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+      if let Some(subs) = entry.get("subs").and_then(|v| v.as_array()) {
+        if let Some(sub) = subs.first() {
+          if let Some(v) = sub.get("price_in_cents").and_then(|val| val.as_i64()) {
+            initial = i32::try_from(v).ok();
+          }
+          if let Some(v) = sub
+            .get("price_in_cents_with_discount")
+            .or_else(|| sub.get("price_with_discount"))
+            .or_else(|| sub.get("price"))
+            .and_then(|val| val.as_i64())
+          {
+            final_price = i32::try_from(v).ok();
+          }
+          if final_price.is_none() {
+            final_price = initial;
+          }
+          if let Some(v) = sub
+            .get("percent_savings")
+            .or_else(|| sub.get("discount_pct"))
+            .and_then(|val| val.as_i64())
+          {
+            discount_percent = i32::try_from(v).ok();
+          } else if let Some(text) = sub
+            .get("percent_savings_text")
+            .and_then(|val| val.as_str())
+          {
+            let parsed = text
+              .trim()
+              .trim_end_matches('%')
+              .parse::<i32>()
+              .ok();
+            if let Some(pct) = parsed {
+              discount_percent = Some(pct);
+            }
+          }
+          if currency.is_none() {
+            currency = sub
+              .get("currency")
+              .and_then(|val| val.as_str())
+              .map(|s| s.to_string());
+          }
+          if let Some(end) = sub
+            .get("discount_end_date")
+            .or_else(|| sub.get("discount_end_timestamp"))
+            .and_then(|val| val.as_i64())
+          {
+            sale_end_iso = iso_from_timestamp(end);
+          }
+        }
+      }
+
+      if let Some(v) = entry
+        .get("sale_price")
+        .and_then(|val| val.as_i64())
+      {
+        final_price = final_price.or_else(|| i32::try_from(v).ok());
+      }
+
+      results.push(WishlistRow {
+        appid,
+        title,
+        added_at_iso,
+        priority,
+        currency: currency.map(|c| c.to_uppercase()).or_else(|| Some(fallback_currency.clone())),
+        initial,
+        final_price,
+        discount_percent: discount_percent.map(|pct| pct.clamp(0, 100)),
+        sale_end_iso,
+      });
+      page_had_rows = true;
+    }
+
+    if !page_had_rows {
+      break;
+    }
+
+    page += 1;
+  }
+
+  Ok(results)
 }
 
 pub fn get_news(appid: u32, count: u8) -> SteamResult<Vec<NewsItem>> {

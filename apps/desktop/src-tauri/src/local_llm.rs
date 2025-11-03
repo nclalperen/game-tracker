@@ -194,8 +194,15 @@ mod impls {
     cmd.arg("--log-disable");
     cmd.arg("--simple-io");
     cmd.arg("-m").arg(model);
-    cmd.arg("-p").arg(prompt);
-    cmd.args(["-n", "256", "-c", "2048", "--temp", "0.7", "--repeat_penalty", "1.1"]);
+    // Llama 3 Instruct models require the chat template markers; wrap the user prompt
+    let sys = "You are a helpful assistant.";
+    let wrapped = format!(
+      "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n{}<|eot_id|>\n<|start_header_id|>user<|end_header_id|>\n{}<|eot_id|>\n<|start_header_id|>assistant<|end_header_id|>",
+      sys,
+      prompt
+    );
+    cmd.arg("-p").arg(wrapped);
+    cmd.args(["-n", "128", "-c", "2048", "--temp", "0.7", "--top-p", "0.9", "--repeat_penalty", "1.1"]);
     run_with_timeout(cmd, None, Duration::from_secs(60))
   }
 

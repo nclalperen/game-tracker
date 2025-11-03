@@ -1,4 +1,4 @@
-﻿
+
 import {
   KeyboardEvent,
   MouseEvent,
@@ -10,13 +10,16 @@ import {
   useRef,
   useState,
 } from "react";
+import { Link } from "react-router-dom";
 import clsx from "clsx";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   db,
   getLibrarySort,
   setLibrarySort,
   getSetting,
   setSetting,
+  upsertSteamAchievementsRow,
   type SteamOwnedRow,
   type SteamRecentRow,
 } from "@/db";
@@ -28,11 +31,16 @@ import { ErrorBoundary as UIErrorBoundary } from "@/ui/ErrorBoundary";
 import { useIGDB } from "@/hooks/useIGDB";
 import { useHLTB } from "@/hooks/useHLTB";
 import { getMCEntry, loadMCIndex, mcKey } from "@/data/metacriticIndex";
-import type { RawgGameCache, RawgMovie, RawgScreenshot } from "@/db";
+import type { RawgGameCache } from "@/db";
 import { ensureRawgDetail, getCachedRawgDetail } from "@/data/rawgCache";
-import { getScreenshots, getMovies } from "@/apis/rawg";
 import { isTauri, fetchOpenCriticScore, fetchSteamPrice } from "@/desktop/bridge";
-import { ensureSteamId, getOwnedGames, getRecentlyPlayed, getSteamProfile } from "@/desktop/steamBridge";
+import {
+  ensureSteamId,
+  getOwnedGames,
+  getPlayerAchievements,
+  getRecentlyPlayed,
+  getSteamProfile,
+} from "@/desktop/steamBridge";
 // Inline detail expansion is used instead of a Drawer
 import { useVendorFlag } from "@/state/vendorFlags";
 
@@ -224,6 +232,7 @@ export default function LibraryPage() {
   const [rows, setRows] = useState<Row[]>([]);
   const [view, setView] = useState<ViewMode>("cards");
   const [nowPlaying, setNowPlaying] = useState<{ appId: number; name?: string } | null>(null);
+  const [steamPersona, setSteamPersona] = useState<string | null>(null);
 
   // Filters
   const [memberFilter, setMemberFilter] = useState<string>(ALL);
@@ -288,11 +297,15 @@ export default function LibraryPage() {
       try {
         const steamId = await getSetting<string>("steam.myId");
         if (!steamId || cancelled) {
-          if (!cancelled) setNowPlaying(null);
+          if (!cancelled) {
+            setNowPlaying(null);
+            setSteamPersona(null);
+          }
           return;
         }
         const profile = await getSteamProfile(steamId);
         if (cancelled) return;
+        setSteamPersona(profile.personaName ?? null);
         const appId = profile.nowPlayingGameId ? Number(profile.nowPlayingGameId) : NaN;
         if (Number.isFinite(appId) && appId > 0) {
           setNowPlaying({ appId, name: profile.nowPlayingGameName ?? undefined });
@@ -300,7 +313,10 @@ export default function LibraryPage() {
           setNowPlaying(null);
         }
       } catch {
-        if (!cancelled) setNowPlaying(null);
+        if (!cancelled) {
+          setNowPlaying(null);
+          setSteamPersona(null);
+        }
       }
     };
 
@@ -564,6 +580,19 @@ export default function LibraryPage() {
 
     return sorted;
   }, [filtered, sortField, sortDirection]);
+  const tableContainerRef = useRef<HTMLDivElement | null>(null);
+  const tableVirtualizer = useVirtualizer({
+    count: tableRows.length,
+    getScrollElement: () => tableContainerRef.current,
+    estimateSize: () => 48,
+    overscan: 8,
+  });
+  const virtualRows = tableVirtualizer.getVirtualItems();
+  const totalTableSize = tableVirtualizer.getTotalSize();
+  const tablePaddingTop = virtualRows.length > 0 ? virtualRows[0].start : 0;
+  const tablePaddingBottom =
+    virtualRows.length > 0 ? totalTableSize - virtualRows[virtualRows.length - 1].end : 0;
+  const TABLE_COLUMN_COUNT = 10;
 
   // Group by identity for card view
   const grouped = useMemo(() => {
@@ -592,7 +621,7 @@ export default function LibraryPage() {
 
   const renderSortableHeader = (field: SortField, label: string, align: "left" | "right" = "left") => {
     const isActive = sortField === field;
-    const indicator = isActive ? (sortDirection === "asc" ? "â–²" : "â–¼") : "â‡…";
+    const indicator = isActive ? (sortDirection === "asc" ? "^" : "v") : "-";
     const ariaSort = isActive ? (sortDirection === "asc" ? "ascending" : "descending") : "none";
 
     return (
@@ -690,6 +719,12 @@ export default function LibraryPage() {
   return (
     <>
       <div className="space-y-4">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <h1 className="text-2xl font-semibold text-zinc-900">Library</h1>
+          <Link to="/explore" className="text-sm font-semibold text-emerald-600 hover:underline">
+            Explore more
+          </Link>
+        </div>
         <ReOnboarding />
         {/* Toolbar */}
         <div className="flex items-center gap-2">
@@ -947,6 +982,7 @@ export default function LibraryPage() {
               onToggle={toggleDetails}
               nowPlayingAppId={nowPlaying?.appId ?? null}
               rawgEnabled={rawgEnabled}
+              steamPersonaName={steamPersona}
             />
           ))}
           {grouped.length === 0 && (
@@ -957,7 +993,7 @@ export default function LibraryPage() {
 
       {/* Table */}
       {view === "table" && (
-        <div className="card overflow-auto">
+        <div ref={tableContainerRef} className="card overflow-auto">
           <table className="w-full text-sm">
             <thead>
               <tr className="text-left text-xs text-zinc-500">
@@ -974,41 +1010,57 @@ export default function LibraryPage() {
               </tr>
             </thead>
             <tbody>
-              {tableRows.map((row) => (
-                <tr key={row.id}>
-                  <td className="px-2 py-1">{row.identity?.title ?? "-"}</td>
-                  <td className="px-2 py-1">{row.identity?.platform ?? "-"}</td>
-                  <td className="px-2 py-1">{row.status}</td>
-                  <td className="px-2 py-1 text-right">
-                    {row.priceTRY != null
-                      ? `${formatCurrency(row.currencyCode)} ${row.priceTRY}`
-                      : "-"}
-                  </td>
-                  <td className="px-2 py-1 text-right">{row.ttbMedianMainH ?? "-"}</td>
-                  <td className="px-2 py-1 text-right">
-                    {(() => {
-                      const pph = pricePerHour(row.priceTRY, row.ttbMedianMainH);
-                      if (pph == null) return "-";
-                      const sym = formatCurrency(row.currencyCode);
-                      return `${sym} ${pph}`;
-                    })()}
-                  </td>
-                  <td className="px-2 py-1 text-right">{row.identity?.ocScore ?? row.ocScore ?? "-"}</td>
-                  <td className="px-2 py-1 text-right">{row.identity?.mcScore ?? row.mcScore ?? "-"}</td>
-                  <td className="px-2 py-1">{row.acquiredAt ?? "-"}</td>
-                  <td className="px-2 py-1">
-                    <button className="btn-ghost" onClick={() => setEditing(row)}>
-                      Edit
-                    </button>
-                  </td>
-                </tr>
-              ))}
-              {tableRows.length === 0 && (
+              {tableRows.length === 0 ? (
                 <tr>
-                  <td colSpan={10} className="px-2 py-3 text-center text-sm text-zinc-500">
+                  <td colSpan={TABLE_COLUMN_COUNT} className="px-2 py-3 text-center text-sm text-zinc-500">
                     Nothing to show. Try changing filters or import some data.
                   </td>
                 </tr>
+              ) : (
+                <>
+                  {tablePaddingTop > 0 && (
+                    <tr style={{ height: tablePaddingTop }}>
+                      <td colSpan={TABLE_COLUMN_COUNT} />
+                    </tr>
+                  )}
+                  {virtualRows.map((virtualRow) => {
+                    const row = tableRows[virtualRow.index];
+                    return (
+                      <tr key={row.id} data-index={virtualRow.index}>
+                        <td className="px-2 py-1">{row.identity?.title ?? "-"}</td>
+                        <td className="px-2 py-1">{row.identity?.platform ?? "-"}</td>
+                        <td className="px-2 py-1">{row.status}</td>
+                        <td className="px-2 py-1 text-right">
+                          {row.priceTRY != null
+                            ? `${formatCurrency(row.currencyCode)} ${row.priceTRY}`
+                            : "-"}
+                        </td>
+                        <td className="px-2 py-1 text-right">{row.ttbMedianMainH ?? "-"}</td>
+                        <td className="px-2 py-1 text-right">
+                          {(() => {
+                            const pph = pricePerHour(row.priceTRY, row.ttbMedianMainH);
+                            if (pph == null) return "-";
+                            const sym = formatCurrency(row.currencyCode);
+                            return `${sym} ${pph}`;
+                          })()}
+                        </td>
+                        <td className="px-2 py-1 text-right">{row.identity?.ocScore ?? row.ocScore ?? "-"}</td>
+                        <td className="px-2 py-1 text-right">{row.identity?.mcScore ?? row.mcScore ?? "-"}</td>
+                        <td className="px-2 py-1">{row.acquiredAt ?? "-"}</td>
+                        <td className="px-2 py-1">
+                          <button className="btn-ghost" onClick={() => setEditing(row)}>
+                            Edit
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                  {tablePaddingBottom > 0 && (
+                    <tr style={{ height: tablePaddingBottom }}>
+                      <td colSpan={TABLE_COLUMN_COUNT} />
+                    </tr>
+                  )}
+                </>
               )}
             </tbody>
           </table>
@@ -1039,13 +1091,14 @@ export default function LibraryPage() {
 }
 
 /** ---------- Cards (grouped by Identity) ---------- */
-function CardGroup({ group, onEdit, expandedId, onToggle, nowPlayingAppId, rawgEnabled }: {
+function CardGroup({ group, onEdit, expandedId, onToggle, nowPlayingAppId, rawgEnabled, steamPersonaName }: {
   group: { identityId: string; identity?: Identity; entries: Row[] };
   onEdit: (r: Row) => void;
   expandedId: string | null;
   onToggle: (identityId: string) => void;
   nowPlayingAppId: number | null;
   rawgEnabled: boolean;
+  steamPersonaName: string | null;
 }) {
   const identity = group.identity;
   const isNowPlaying = identity?.appid != null && nowPlayingAppId === identity.appid;
@@ -1240,11 +1293,15 @@ function CardGroup({ group, onEdit, expandedId, onToggle, nowPlayingAppId, rawgE
     "inline-flex items-center gap-1 rounded-full border border-zinc-200 bg-zinc-100 px-2.5 py-0.5 text-[11px] font-semibold text-zinc-600 shadow-sm";
   const entriesLabel = group.entries.length === 1 ? "entry" : "entries";
 
-  const accountLabel =
+  const baseAccountLabel =
     best.account?.label ??
     (best.accountId && best.accountId.toLowerCase() === "steam" ? "Steam" : undefined) ??
     (best.services?.some((svc) => svc.toLowerCase() === "steam") ? "Steam" : undefined) ??
     "-";
+  const accountLabel =
+    baseAccountLabel === "Steam" && steamPersonaName
+      ? `${baseAccountLabel} (${steamPersonaName})`
+      : baseAccountLabel;
   const memberLabel =
     best.member?.name ?? (best.memberId && best.memberId !== "everyone" ? best.memberId : "Everyone");
   const formatPlaytime = useCallback((minutes?: number | null) => {
@@ -1408,7 +1465,7 @@ function CardGroup({ group, onEdit, expandedId, onToggle, nowPlayingAppId, rawgE
         >
           <UIErrorBoundary title="Game details failed">
             <Suspense fallback={<InlineDetailsFallback />}>
-              <GameDetails identityId={identity.id} />
+              <GameDetails identityId={identity.id} variant="compact" />
             </Suspense>
           </UIErrorBoundary>
         </div>
@@ -1421,7 +1478,7 @@ function CardGroup({ group, onEdit, expandedId, onToggle, nowPlayingAppId, rawgE
           isExpanded ? "rotate-180" : "",
         )}
       >
-        â–¾
+        ▾
       </span>
 
     </article>
@@ -1448,12 +1505,6 @@ function Editor({
   const [ttb, setTtb] = useState<number | null>(current?.ttbMedianMainH ?? null);
   const [ocScore, setOcScore] = useState<number | null>(current?.identity?.ocScore ?? current?.ocScore ?? null);
   const [mcScore, setMcScore] = useState<number | null>(current?.identity?.mcScore ?? current?.mcScore ?? null);
-  const [rawgDetail, setRawgDetail] = useState<RawgGameCache | null>(null);
-  const [rawgScreens, setRawgScreens] = useState<RawgScreenshot[]>([]);
-  const [rawgTrailer, setRawgTrailer] = useState<RawgMovie | null>(null);
-  const [rawgMediaLoading, setRawgMediaLoading] = useState(false);
-  const [selectedShot, setSelectedShot] = useState(0);
-
   const currentAppid = current?.identity?.appid ?? null;
   const [appidInput, setAppidInput] = useState<string>(currentAppid ? String(currentAppid) : "");
 
@@ -1477,88 +1528,7 @@ function Editor({
     setAppidInput(currentAppid ? String(currentAppid) : "");
   }, [currentAppid]);
 
-  useEffect(() => {
-    const title = current?.identity?.title;
-    if (!title) {
-      setRawgDetail(null);
-      return;
-    }
-    let cancelled = false;
-    void ensureRawgDetail(title).then((detail) => {
-      if (!cancelled) {
-        setRawgDetail(detail);
-      }
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [current?.identity?.title]);
-
-  useEffect(() => {
-    if (!rawgDetail?.id) {
-      setRawgScreens([]);
-      setRawgTrailer(null);
-      setSelectedShot(0);
-      return;
-    }
-    let cancelled = false;
-    setRawgMediaLoading(true);
-    (async () => {
-      try {
-        const [screensResp, moviesResp] = await Promise.all([
-          getScreenshots(rawgDetail.id, 6).catch(() => null),
-          getMovies(rawgDetail.id).catch(() => null),
-        ]);
-        if (cancelled) return;
-        const shots: RawgScreenshot[] = Array.isArray(screensResp?.results)
-          ? screensResp.results
-              .map((shot: any, index: number) => ({
-                id: typeof shot?.id === "number" ? shot.id : index,
-                image: shot?.image ?? "",
-                width: shot?.width ?? undefined,
-                height: shot?.height ?? undefined,
-                isVideo: false,
-                thumbnail: shot?.image ?? null,
-              }))
-              .filter((shot: RawgScreenshot) => Boolean(shot.image))
-          : [];
-        setRawgScreens(shots);
-        setSelectedShot(0);
-
-        const trailerItem = Array.isArray(moviesResp?.results)
-          ? moviesResp.results.find((movie: any) => movie?.preview || movie?.data?.max)
-          : null;
-        const trailer: RawgMovie | null = trailerItem
-          ? {
-              id: trailerItem.id ?? 0,
-              name: trailerItem.name ?? "Trailer",
-              preview: trailerItem.preview ?? null,
-              data: trailerItem.data ?? {},
-            }
-          : null;
-        setRawgTrailer(trailer);
-      } catch (_err) {
-        if (!cancelled) {
-          setRawgScreens([]);
-          setRawgTrailer(null);
-        }
-      } finally {
-        if (!cancelled) setRawgMediaLoading(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [rawgDetail?.id]);
-
   if (!open || !current) return null;
-
-  const heroShot = rawgScreens[selectedShot] ?? rawgScreens[0];
-  const heroSrc = heroShot?.image ?? rawgDetail?.backgroundImage ?? null;
-  const heroAlt =
-    heroShot?.image
-      ? `RAWG screenshot ${selectedShot + 1}`
-      : rawgDetail?.title ?? current.identity?.title ?? "Game artwork";
 
   const openCriticPref = typeof window !== "undefined" ? localStorage.getItem("oc_enabled") === "1" : false;
   const openCriticAvailable = flags.openCriticEnabled || openCriticPref;
@@ -1572,6 +1542,33 @@ function Editor({
   })();
 
   const currencyLabel = (code: string | null | undefined) => formatCurrency(code);
+
+  const currencySymbol = currencyLabel(currency) ?? currency ?? "TRY";
+  const hasPrice = Number.isFinite(price);
+  const priceDisplay = hasPrice
+    ? `${currencySymbol} ${price.toLocaleString(undefined, { maximumFractionDigits: 2 })}`
+    : "—";
+  const pricePerHourValue = pricePerHour(price, ttb ?? undefined);
+  const pricePerHourDisplay =
+    pricePerHourValue != null ? `${currencySymbol} ${pricePerHourValue}` : "—";
+  const hoursPerCurrencyValue =
+    price > 0 && ttb != null && ttb > 0 ? ttb / price : null;
+  const hoursPerCurrencyDisplay =
+    hoursPerCurrencyValue != null
+      ? `${hoursPerCurrencyValue.toFixed(2)} h / ${currencySymbol}`
+      : "—";
+  const ttbDisplay = ttb != null ? `${ttb} h` : "—";
+  const criticDisplay =
+    ocScore != null
+      ? `OpenCritic ${ocScore}`
+      : mcScore != null
+        ? `Metacritic ${mcScore}`
+        : "—";
+  const servicesLine = current.services?.length ? current.services.join(", ") : null;
+  const accountLabel = current.account?.label ?? "Unassigned";
+  const memberLabel = current.member?.name ?? "Unassigned";
+  const statusDisplay = status;
+  const appidDisplay = currentAppid ?? "—";
 
   const updateIdentity = async (values: Partial<Identity>) => {
     if (!current.identity?.id) return;
@@ -1684,6 +1681,30 @@ function Editor({
       };
       await db.steamOwned.put(ownedRow);
 
+      let achievementsSummary: { unlocked: number; total: number } | null = null;
+      if (ownedEntry.hasVisibleStats) {
+        try {
+          const achievements = await getPlayerAchievements(normalizedId, currentAppid);
+          if (achievements) {
+            achievementsSummary = { unlocked: achievements.unlocked, total: achievements.total };
+            await upsertSteamAchievementsRow({
+              steamid: normalizedId,
+              appid: currentAppid,
+              unlocked: achievements.unlocked,
+              total: achievements.total,
+              items: achievements.items.map((item) => ({
+                apiName: item.apiName,
+                achieved: item.achieved,
+                unlockTime: item.unlockTime ?? null,
+              })),
+              lastFetchedISO: achievements.lastFetchedISO ?? timestamp,
+            });
+          }
+        } catch (_err) {
+          // Ignore achievement fetch failures; status heuristics fall back to playtime.
+        }
+      }
+
       const services = new Set(current.services ?? []);
       services.add("Steam");
       const lastPlayedISO =
@@ -1703,7 +1724,44 @@ function Editor({
       if (ownedEntry.playtimeForeverMin > 0) {
         libraryUpdates.installed = true;
       }
+      const ttbHours = current.identity?.ttbMedianMainH ?? current.ttbMedianMainH ?? null;
+      const playtimeHours = ownedEntry.playtimeForeverMin / 60;
+      const completedByAchievements =
+        achievementsSummary != null && achievementsSummary.total > 0 && achievementsSummary.unlocked >= achievementsSummary.total;
+      const completedByTtb = ttbHours != null && playtimeHours >= ttbHours;
+      const hasMeaningfulPlay = ownedEntry.playtimeForeverMin >= 60;
+
+      let statusCandidate: Status | null = "Owned";
+      if (completedByAchievements || completedByTtb) {
+        statusCandidate = "Beaten";
+      } else if (hasMeaningfulPlay) {
+        statusCandidate = "Playing";
+      }
+
+      let nextStatus = current.status;
+      if (statusCandidate === "Beaten" && current.status !== "Beaten" && current.status !== "Abandoned") {
+        nextStatus = "Beaten";
+      } else if (
+        statusCandidate === "Playing" &&
+        (current.status === "Backlog" || current.status === "Owned" || current.status === "Wishlist")
+      ) {
+        nextStatus = "Playing";
+      } else if (
+        statusCandidate === "Owned" &&
+        (current.status === "Backlog" || current.status === "Wishlist")
+      ) {
+        nextStatus = "Owned";
+      }
+
+      const statusChanged = nextStatus !== current.status;
+      if (statusChanged) {
+        libraryUpdates.status = nextStatus;
+      }
+
       await db.library.update(current.id, libraryUpdates);
+      if (statusChanged) {
+        setStatus(nextStatus);
+      }
 
       try {
         const recentGames = await getRecentlyPlayed(normalizedId);
@@ -1732,7 +1790,11 @@ function Editor({
       }
 
       window.dispatchEvent(new Event("gt:library-reload"));
-      onNotify("Steam playtime refreshed from your account.");
+      const notifyParts = ["Steam playtime refreshed from your account."];
+      if (statusChanged) {
+        notifyParts.push(`Status updated to ${nextStatus}.`);
+      }
+      onNotify(notifyParts.join(" "));
     } catch (err: any) {
       onNotify(err?.message || "Steam personal data fetch failed.");
     } finally {
@@ -1901,88 +1963,45 @@ function Editor({
             />
           </div>
         </div>
-        {rawgDetail ? (
-          <div className="space-y-3 rounded-2xl border border-zinc-200 bg-white p-3 shadow-inner">
-            <div className="rounded bg-zinc-100 px-3 py-2 text-xs leading-relaxed text-zinc-600">
-              <div>
-                <span className="font-medium text-zinc-700">Genres:</span>{" "}
-                {rawgDetail.genres.length ? rawgDetail.genres.join(", ") : "-"}
-              </div>
-              {rawgDetail.stores.length ? (
-                <div>
-                  <span className="font-medium text-zinc-700">Stores:</span>{" "}
-                  {rawgDetail.stores.map((s) => s.name).join(", ")}
-                </div>
-              ) : null}
-              {rawgDetail.slug ? (
-                <div>
-                  <a
-                    className="text-emerald-600 underline"
-                    href={`https://rawg.io/games/${rawgDetail.slug}`}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    View on RAWG
-                  </a>
-                </div>
-              ) : null}
-            </div>
-
-            {rawgMediaLoading ? (
-              <p className="text-xs text-zinc-500">Loading RAWG media...</p>
-            ) : null}
-
-            {heroSrc ? (
-              <div className="space-y-2">
-                <div className="relative overflow-hidden rounded-xl border border-zinc-200 bg-zinc-900/5">
-                  <div style={{ aspectRatio: "16 / 9" }}>
-                    <img src={heroSrc} alt={heroAlt} className="h-full w-full object-cover" loading="lazy" />
-                  </div>
-                  {heroShot?.width && heroShot?.height ? (
-                    <span className="absolute bottom-2 right-2 rounded-full bg-black/60 px-2 py-0.5 text-[10px] font-medium text-white">
-                      {heroShot.width}x{heroShot.height}
-                    </span>
-                  ) : null}
-                </div>
-                {rawgScreens.length > 1 ? (
-                  <div className="flex gap-2 overflow-x-auto pb-1">
-                    {rawgScreens.map((shot, index) => (
-                      <button
-                        key={`${shot.id}-${index}`}
-                        type="button"
-                        onClick={() => setSelectedShot(index)}
-                        className={clsx(
-                          "relative h-16 w-28 flex-shrink-0 overflow-hidden rounded-lg border transition",
-                          selectedShot === index ? "border-emerald-500 shadow" : "border-transparent hover:border-zinc-300",
-                        )}
-                        aria-label={`Show screenshot ${index + 1}`}
-                        aria-selected={selectedShot === index}
-                      >
-                        <img src={shot.image} alt="" className="h-full w-full object-cover" loading="lazy" />
-                        {selectedShot === index ? <span className="absolute inset-0 rounded-lg border-2 border-emerald-400/70" /> : null}
-                      </button>
-                    ))}
-                  </div>
-                ) : null}
-              </div>
-            ) : null}
-
-            {rawgTrailer && (rawgTrailer.data?.max || rawgTrailer.preview) ? (
-              <div className="space-y-2">
-                <h4 className="text-xs font-semibold uppercase tracking-wide text-zinc-500">Trailer</h4>
-                <video
-                  className="w-full rounded-xl border border-zinc-200"
-                  controls
-                  poster={rawgTrailer.preview ?? undefined}
-                >
-                  {rawgTrailer.data?.max ? <source src={rawgTrailer.data.max} /> : null}
-                  {rawgTrailer.data?.["480"] ? <source src={rawgTrailer.data["480"]} /> : null}
-                  Your browser does not support embedded video.
-                </video>
-              </div>
+        <div className="space-y-3 rounded-2xl border border-zinc-200 bg-white p-3 shadow-inner">
+          <div className="space-y-1">
+            <h3 className="text-base font-semibold text-zinc-900">
+              {current.identity?.title ?? "Untitled"}
+            </h3>
+            <p className="text-xs text-zinc-500">
+              Platform: {current.identity?.platform ?? "Unassigned"}
+            </p>
+            <p className="text-xs text-zinc-500">Status: {statusDisplay}</p>
+            <p className="text-xs text-zinc-500">
+              Account: {accountLabel} / Member: {memberLabel}
+            </p>
+            {servicesLine ? (
+              <p className="text-xs text-zinc-500">Services: {servicesLine}</p>
             ) : null}
           </div>
-        ) : null}
+          <dl className="grid grid-cols-2 gap-3 text-xs text-zinc-500 sm:grid-cols-3">
+            <div>
+              <dt className="font-semibold text-zinc-600">Price</dt>
+              <dd className="text-sm text-zinc-900">{priceDisplay}</dd>
+            </div>
+            <div>
+              <dt className="font-semibold text-zinc-600">Hours / price</dt>
+              <dd className="text-sm text-zinc-900">{hoursPerCurrencyDisplay}</dd>
+            </div>
+            <div>
+              <dt className="font-semibold text-zinc-600">TTB median</dt>
+              <dd className="text-sm text-zinc-900">{ttbDisplay}</dd>
+            </div>
+            <div>
+              <dt className="font-semibold text-zinc-600">Critic score</dt>
+              <dd className="text-sm text-zinc-900">{criticDisplay}</dd>
+            </div>
+            <div>
+              <dt className="font-semibold text-zinc-600">Steam appid</dt>
+              <dd className="text-sm text-zinc-900">{appidDisplay}</dd>
+            </div>
+          </dl>
+        </div>
 
         <div className="grid grid-cols-3 gap-2">
           <button

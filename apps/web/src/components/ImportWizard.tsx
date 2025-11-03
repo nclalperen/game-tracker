@@ -6,9 +6,11 @@ import {
   replaceSteamOwnedRows,
   replaceSteamRecentRows,
   setSetting,
+  upsertWishlist,
   type EnrichStatus,
   type SteamOwnedRow,
   type SteamRecentRow,
+  type WishlistItem,
 } from "@/db";
 import {
   useEnrichmentRunner,
@@ -20,12 +22,12 @@ import {
   ensureSteamId,
   getOwnedGames,
   getRecentlyPlayed,
+  getSteamWishlist,
   scanSteamManifests,
   type SteamInstallInfo,
   type SteamRecentlyPlayed,
 } from "@/desktop/steamBridge";
 import {
-  readCSV,
   rowsToEntities,
   type FieldMap,
   type IncomingRow,
@@ -34,6 +36,12 @@ import {
   type Account,
   nanoid,
 } from "@tracker/core";
+import { parseCsvWithWorker } from "@/workers/normalizeClient";
+import {
+  startWishlistSync,
+  updateWishlistSync,
+  finishWishlistSync,
+} from "@/state/wishlistSync";
 
 type Step = "source" | "map" | "review" | "enrich";
 
@@ -75,8 +83,11 @@ export default function ImportWizard({ open, onClose, onImported }: ImportWizard
   const [autoStartEnrich, setAutoStartEnrich] = useState(true);
   const [steamId, setSteamId] = useState<string | null>(null);
   const [steamRegion, setSteamRegion] = useState("us");
+  const [steamLanguage, setSteamLanguage] = useState("en");
   const [steamReady, setSteamReady] = useState(false);
   const [steamImporting, setSteamImporting] = useState(false);
+  const [steamWishlistImporting, setSteamWishlistImporting] = useState(false);
+  const [wishlistSummary, setWishlistSummary] = useState<{ count: number; titles: string[] } | null>(null);
 
   const { snapshot, start, pause, resume, halt } = useEnrichmentRunner();
 
@@ -108,14 +119,17 @@ export default function ImportWizard({ open, onClose, onImported }: ImportWizard
     }
     (async () => {
       try {
-        const [storedId, storedRegion] = await Promise.all([
+        const [storedId, storedRegion, storedLang] = await Promise.all([
           getSetting<string>("steam.myId"),
           getSetting<string>("steam.region"),
+          getSetting<string>("steam.lang"),
         ]);
         if (cancelled) return;
         setSteamId(storedId ?? null);
         const region = (storedRegion || localStorage.getItem("steam_cc") || "us").toLowerCase();
+        const language = (storedLang || localStorage.getItem("steam_lang") || "en").toLowerCase();
         setSteamRegion(region);
+        setSteamLanguage(language);
         setSteamReady(Boolean(storedId));
       } catch {
         if (!cancelled) {
@@ -154,7 +168,8 @@ export default function ImportWizard({ open, onClose, onImported }: ImportWizard
         }
         rows = parsed as IncomingRow[];
       } else {
-        rows = readCSV(text) as IncomingRow[];
+        const parsed = await parseCsvWithWorker(text);
+        rows = parsed.rows as IncomingRow[];
       }
       if (!rows.length) {
         throw new Error("No rows detected in file.");
@@ -182,6 +197,82 @@ export default function ImportWizard({ open, onClose, onImported }: ImportWizard
     }
     return raw;
   };
+
+  const handleSteamWishlistImport = useCallback(async () => {
+    if (!isTauri) {
+      setError("Steam wishlist import requires the desktop app.");
+      return;
+    }
+    if (!steamId) {
+      setError("Save your Steam ID in Settings before syncing the wishlist.");
+      return;
+    }
+    setSteamWishlistImporting(true);
+    setError(null);
+    setWishlistSummary(null);
+    try {
+      startWishlistSync("Resolving Steam ID…");
+      const { id: normalizedId, resolved } = await ensureSteamId(steamId);
+      if (resolved || normalizedId !== steamId) {
+        await setSetting("steam.myId", normalizedId);
+        setSteamId(normalizedId);
+      }
+      setSteamReady(true);
+      updateWishlistSync("Saving region preferences…");
+      const region = (steamRegion || "us").toLowerCase();
+      const language = (steamLanguage || "en").toLowerCase();
+      await Promise.all([
+        setSetting("steam.region", region),
+        setSetting("steam.lang", language),
+      ]);
+      localStorage.setItem("steam_cc", region);
+      localStorage.setItem("steam_lang", language);
+      updateWishlistSync("Fetching Steam wishlist…");
+      const wishlistRows = await getSteamWishlist(normalizedId, region, language);
+      if (!wishlistRows.length) {
+        setError("Steam wishlist is empty or private.");
+        finishWishlistSync({ success: false, message: "Steam wishlist returned no items." });
+        setSteamWishlistImporting(false);
+        return;
+      }
+      updateWishlistSync("Saving items…", { current: 0, total: wishlistRows.length });
+      const timestamp = new Date().toISOString();
+      const items: WishlistItem[] = wishlistRows.map((row) => {
+        const currency = (row.currency ?? region).toUpperCase();
+        return {
+          appid: row.appId,
+          title: row.title,
+          addedAtISO: row.addedAtISO ?? null,
+          priority: row.priority ?? null,
+          notes: null,
+          source: "steam",
+          platform: null,
+          currency,
+          initial: row.initial ?? null,
+          final: row.final ?? null,
+          discountPercent: row.discountPercent ?? null,
+          saleEndISO: row.saleEndISO ?? null,
+          lastFetchedISO: timestamp,
+        };
+      });
+      await upsertWishlist(items);
+      updateWishlistSync("Wishlist saved.", { current: items.length, total: items.length });
+      setWishlistSummary({
+        count: items.length,
+        titles: items.slice(0, 3).map((item) => item.title),
+      });
+      finishWishlistSync({
+        success: true,
+        message: `Synced ${items.length} item${items.length === 1 ? "" : "s"}.`,
+      });
+    } catch (err) {
+      const message = formatSteamError(err, "Steam wishlist import failed.");
+      setError(message);
+      finishWishlistSync({ success: false, message });
+    } finally {
+      setSteamWishlistImporting(false);
+    }
+  }, [steamId, steamRegion, steamLanguage, formatSteamError, ensureSteamId, getSteamWishlist, setSetting, upsertWishlist]);
 
   const handleSteamImport = async () => {
     if (!isTauri) {
@@ -458,6 +549,10 @@ export default function ImportWizard({ open, onClose, onImported }: ImportWizard
             onImportSteam={handleSteamImport}
             steamAvailable={steamReady}
             steamImporting={steamImporting}
+            onImportSteamWishlist={handleSteamWishlistImport}
+            steamWishlistAvailable={steamReady}
+            steamWishlistImporting={steamWishlistImporting}
+            wishlistSummary={wishlistSummary}
           />
         )}
 
@@ -507,6 +602,10 @@ function SourceStep({
   onImportSteam,
   steamAvailable,
   steamImporting,
+  onImportSteamWishlist,
+  steamWishlistAvailable,
+  steamWishlistImporting,
+  wishlistSummary,
 }: {
   fileName: string;
   onFile: (file: File) => void;
@@ -514,6 +613,10 @@ function SourceStep({
   onImportSteam: () => void;
   steamAvailable: boolean;
   steamImporting: boolean;
+  onImportSteamWishlist: () => void;
+  steamWishlistAvailable: boolean;
+  steamWishlistImporting: boolean;
+  wishlistSummary: { count: number; titles: string[] } | null;
 }) {
   return (
     <div className="space-y-4">
@@ -534,16 +637,54 @@ function SourceStep({
           </div>
           <button
             type="button"
-            className="btn"
+            className={`btn ${
+              !steamAvailable && !steamImporting ? "cursor-not-allowed opacity-60" : ""
+            }`}
             onClick={onImportSteam}
-            disabled={!steamAvailable || steamImporting}
+            disabled={steamImporting}
+            aria-disabled={!steamAvailable && !steamImporting}
             title={
               steamAvailable
                 ? "Fetch owned games from Steam"
-                : "Desktop-only: configure Steam in Settings"
+                : "Configure Steam in Settings (desktop feature)"
             }
           >
             {steamImporting ? "Fetching..." : "Import from Steam"}
+          </button>
+        </div>
+      </div>
+
+      <div className="rounded-lg border border-zinc-200 bg-white p-4 shadow-sm">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h3 className="text-sm font-semibold text-zinc-700">Steam wishlist (desktop)</h3>
+            <p className="text-xs text-zinc-500">
+              {steamWishlistAvailable
+                ? "Sync the latest wishlist entries from your Steam profile."
+                : "Save your Steam ID in Settings to enable this option."}
+            </p>
+            {wishlistSummary && (
+              <p className="text-xs text-emerald-600">
+                Synced {wishlistSummary.count} items
+                {wishlistSummary.titles.length ? ` — ${wishlistSummary.titles.join(", ")}` : ""}.
+              </p>
+            )}
+          </div>
+          <button
+            type="button"
+            className={`btn ${
+              !steamWishlistAvailable && !steamWishlistImporting ? "cursor-not-allowed opacity-60" : ""
+            }`}
+            onClick={onImportSteamWishlist}
+            disabled={steamWishlistImporting}
+            aria-disabled={!steamWishlistAvailable && !steamWishlistImporting}
+            title={
+              steamWishlistAvailable
+                ? "Fetch current Steam wishlist"
+                : "Configure Steam in Settings (desktop feature)"
+            }
+          >
+            {steamWishlistImporting ? "Syncing..." : "Sync wishlist"}
           </button>
         </div>
       </div>

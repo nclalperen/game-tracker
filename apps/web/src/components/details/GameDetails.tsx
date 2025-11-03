@@ -1,5 +1,12 @@
 ﻿import { useEffect, useMemo, useState, useCallback, useId } from "react";
-import { normalizeTitle, pricePerHour, buildFinishPlan } from "@tracker/core";
+import {
+  normalizeTitle,
+  pricePerHour,
+  modalSessionMinutes,
+  planSessions,
+  type PlannerResult,
+  type PlannerStep,
+} from "@tracker/core";
 import type { Identity, LibraryItem } from "@tracker/core";
 import {
   db,
@@ -17,6 +24,9 @@ import {
   getSteamRecentRows,
   getSteamPlayerCountRow,
   recentSessions,
+  getPlanForIdentity,
+  savePlan,
+  updatePlan,
   isSteamPriceStale,
   isSteamNewsStale,
   isSteamAchievementsStale,
@@ -40,6 +50,8 @@ import {
   type SteamOwnedRow,
   type SteamRecentRow,
   type SteamPriceRow,
+  type PlanRow,
+  type PlanStep,
 } from "@/db";
 import { searchByTitle, getGame, getScreenshots, getMovies } from "@/apis/rawg";
 import { sanitizeHtml } from "@/utils/sanitizeHtml";
@@ -1316,14 +1328,26 @@ function AchievementsTab({ data, appid }: { data: GameDetailsData["steamAchievem
   );
 }
 
-export default function GameDetails({ identityId }: { identityId: string }) {
+type GameDetailsVariant = "full" | "compact";
+
+export default function GameDetails({
+  identityId,
+  variant = "full",
+}: {
+  identityId: string;
+  variant?: GameDetailsVariant;
+}) {
   const rawgEnabled = useVendorFlag("rawg");
   const metacriticEnabled = useVendorFlag("metacritic");
   const state = useGameDetails(identityId, { rawgEnabled, metacriticEnabled });
-  const { activeTab, setTab } = useTab("media");
+  const { activeTab, setTab } = useTab(variant === "compact" ? "overview" : "media");
   const tabBaseId = useId();
-  const [sessionMedian, setSessionMedian] = useState<number | null>(null);
+  const [sessionMedian, setSessionMedian] = useState<number>(0);
   const [planOpen, setPlanOpen] = useState(false);
+  const [planRow, setPlanRow] = useState<PlanRow | null>(null);
+  const [planSaving, setPlanSaving] = useState(false);
+  const [planError, setPlanError] = useState<string | null>(null);
+  const [planUpdatingIndex, setPlanUpdatingIndex] = useState<number | null>(null);
 
   useEffect(() => {
     if (state.status === "ready") {
@@ -1333,22 +1357,39 @@ export default function GameDetails({ identityId }: { identityId: string }) {
 
   useEffect(() => {
     let cancelled = false;
+    setPlanRow(null);
+    setPlanOpen(false);
+    setPlanError(null);
+    setPlanSaving(false);
+    setPlanUpdatingIndex(null);
+    (async () => {
+      try {
+        const existing = await getPlanForIdentity(identityId);
+        if (!cancelled) {
+          setPlanRow(existing ?? null);
+        }
+      } catch (error) {
+        console.error("Failed to load finish plan", error);
+        if (!cancelled) {
+          setPlanRow(null);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [identityId]);
+
+  useEffect(() => {
+    let cancelled = false;
     async function loadMedian() {
       try {
         const sessions = await recentSessions(10);
-        const durations = sessions
-          .map((session) => session.durationMs ?? null)
-          .filter((value): value is number => value != null && value > 0)
-          .map((value) => Math.round(value / 60000));
-        if (!durations.length) {
-          if (!cancelled) setSessionMedian(null);
-          return;
-        }
-        durations.sort((a, b) => a - b);
-        const median = durations[Math.floor(durations.length / 2)];
+        const median = modalSessionMinutes(sessions);
         if (!cancelled) setSessionMedian(median);
-      } catch {
-        if (!cancelled) setSessionMedian(null);
+      } catch (error) {
+        console.error("Failed to compute session median", error);
+        if (!cancelled) setSessionMedian(0);
       }
     }
     void loadMedian();
@@ -1436,23 +1477,118 @@ export default function GameDetails({ identityId }: { identityId: string }) {
     return remaining;
   }, [data]);
 
-  const finishPlan = useMemo(() => {
-    if (remainingHours == null || remainingHours <= 0) return [];
-    if (sessionMedian == null || sessionMedian <= 0) return [];
-    return buildFinishPlan(remainingHours, sessionMedian);
+  const planPreview: PlannerResult | null = useMemo(() => {
+    if (remainingHours == null || remainingHours <= 0) return null;
+    return planSessions(remainingHours, sessionMedian);
   }, [remainingHours, sessionMedian]);
 
+  const previewSteps: PlanStep[] = useMemo(() => {
+    if (!planPreview?.steps.length) return [];
+    return planPreview.steps.map((step: PlannerStep) => ({
+      minutes: step.minutes,
+      done: false,
+      dateSuggestion: step.dateSuggestion ?? null,
+    }));
+  }, [planPreview]);
+
+  const planSteps = planRow?.steps ?? previewSteps;
+  const hasPlan = planSteps.length > 0;
+  const planSessionsCount = planSteps.length;
+
   const totalPlanMinutes = useMemo(
-    () => finishPlan.reduce((sum, step) => sum + step.minutes, 0),
-    [finishPlan],
+    () => planSteps.reduce((sum: number, step: PlanStep) => sum + step.minutes, 0),
+    [planSteps],
   );
   const totalPlanHours = useMemo(() => Math.round((totalPlanMinutes / 60) * 10) / 10, [totalPlanMinutes]);
+  const planCompletedCount =
+    planRow?.doneCount ?? planSteps.filter((step: PlanStep) => step.done).length;
 
   useEffect(() => {
-    if (!finishPlan.length) {
+    if (!hasPlan) {
       setPlanOpen(false);
     }
-  }, [finishPlan.length]);
+  }, [hasPlan]);
+
+  const handlePlanToggle = useCallback(async () => {
+    if (planOpen) {
+      setPlanOpen(false);
+      return;
+    }
+    if (!planRow && !previewSteps.length) {
+      setPlanError("Not enough data to build a plan yet.");
+      return;
+    }
+    let planAvailable = Boolean(planRow && planRow.steps?.length);
+    if (!planRow && previewSteps.length) {
+      setPlanSaving(true);
+      setPlanError(null);
+      try {
+        await savePlan(identityId, previewSteps);
+        const latest = await getPlanForIdentity(identityId);
+        if (latest) {
+          setPlanRow(latest);
+          planAvailable = true;
+        }
+      } catch (error) {
+        console.error("Failed to save finish plan", error);
+        setPlanError("Unable to build a plan right now.");
+        planAvailable = false;
+      } finally {
+        setPlanSaving(false);
+      }
+    }
+    if (planAvailable || previewSteps.length) {
+      setPlanError(null);
+      setPlanOpen(true);
+    }
+  }, [planOpen, planRow, previewSteps, identityId]);
+
+  const handleRegeneratePlan = useCallback(async () => {
+    if (!previewSteps.length) return;
+    setPlanSaving(true);
+    setPlanError(null);
+    try {
+      await savePlan(identityId, previewSteps);
+      const latest = await getPlanForIdentity(identityId);
+      if (latest) {
+        setPlanRow(latest);
+        setPlanOpen(true);
+      }
+    } catch (error) {
+      console.error("Failed to refresh plan", error);
+      setPlanError("Unable to refresh the plan right now.");
+    } finally {
+      setPlanSaving(false);
+    }
+  }, [identityId, previewSteps]);
+
+  const handleTogglePlanStep = useCallback(
+    async (index: number) => {
+      if (!planRow || planRow.id == null) return;
+      if (index < 0 || index >= planRow.steps.length) return;
+      const updated = planRow.steps.map((step: PlanStep, idx: number) =>
+        idx === index ? { ...step, done: !step.done } : step,
+      );
+      setPlanUpdatingIndex(index);
+      try {
+        await updatePlan(planRow.id, updated);
+        setPlanRow((prev) => {
+          if (!prev || prev.id !== planRow.id) return prev;
+          return {
+            ...prev,
+            steps: updated,
+            doneCount: updated.filter((step: PlanStep) => step.done).length,
+            updatedAtISO: new Date().toISOString(),
+          };
+        });
+      } catch (error) {
+        console.error("Failed to toggle plan step", error);
+      } finally {
+        setPlanUpdatingIndex(null);
+      }
+    },
+    [planRow],
+  );
 
   if (state.status === "error") {
     return (
@@ -1494,6 +1630,14 @@ export default function GameDetails({ identityId }: { identityId: string }) {
 
   const tabButtonId = (key: TabKey) => `${tabBaseId}-${key}-tab`;
   const tabPanelId = (key: TabKey) => `${tabBaseId}-${key}-panel`;
+  const showHero = variant === "full";
+  const prioritizedCritic =
+    data.criticBadge?.value != null
+      ? { value: data.criticBadge.value, source: data.criticBadge.label }
+      : data.criticSources.find((source) => source.value != null) ?? null;
+  const criticSnapshotLabel = prioritizedCritic
+    ? `${prioritizedCritic.value} (${prioritizedCritic.source})`
+    : "-";
 
   return (
     <div
@@ -1502,97 +1646,99 @@ export default function GameDetails({ identityId }: { identityId: string }) {
       onMouseDown={(event) => event.stopPropagation()}
       onClick={(event) => event.stopPropagation()}
     >
-      <section className="rounded-3xl border border-emerald-100 bg-white p-4 shadow-sm sm:p-6">
-        <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-          <div className="space-y-1">
-            <h2 id="game-details-title" className="text-2xl font-semibold leading-tight text-zinc-900">
-              {data.identity.title ?? "Untitled game"}
-            </h2>
-            {primaryEntry?.status ? (
-              <p className="text-sm text-zinc-500">
-                Library status <span className="font-medium text-zinc-700">{primaryEntry.status}</span>
-              </p>
-            ) : null}
-          </div>
-          <div className="flex flex-wrap items-start gap-3">
-            <div className="h-28 w-20 overflow-hidden rounded border border-zinc-200 bg-zinc-100">
-              <GameCover identity={data.identity} size="md" />
-            </div>
-            {appid ? (
-              <div className="flex flex-col items-stretch gap-2 sm:flex-row sm:items-center">
-                {primaryActionHref ? (
-                  <a
-                    href={primaryActionHref}
-                    className="btn rounded-full px-4 py-2 text-sm font-semibold"
-                    onClick={(event) => event.stopPropagation()}
-                  >
-                    {installed ? "Play" : "Install"}
-                  </a>
-                ) : null}
-                {steamStoreUrl ? (
-                  <a
-                    href={steamStoreUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="btn-ghost rounded-full px-4 py-2 text-sm font-semibold"
-                    onClick={(event) => event.stopPropagation()}
-                  >
-                    Open Store
-                  </a>
-                ) : null}
-              </div>
-            ) : null}
-          </div>
-        </div>
-        {!rawgEnabled && (
-          <p className="mt-2 text-xs text-zinc-500">
-            RAWG integration is disabled. Media and critic data are limited to cached sources.
-          </p>
-        )}
-        <div className="mt-4 flex flex-wrap items-center gap-2">
-          {data.criticBadge ? <ScoreBadge badge={data.criticBadge} /> : null}
-          <TtbBadge ttb={data.ttb} />
-          {priceInfo ? (
-            <span className="inline-flex items-center gap-1 rounded-full border border-zinc-200 bg-zinc-100 px-2.5 py-1 text-xs font-semibold text-zinc-700">
-              Price {priceInfo.label}
-              {priceInfo.source === "steam" && priceInfo.discountPercent != null && priceInfo.discountPercent > 0 ? (
-                <span className="ml-1 text-[11px] font-medium text-emerald-600">-{priceInfo.discountPercent}%</span>
+      {showHero ? (
+        <section className="rounded-3xl border border-emerald-100 bg-white p-4 shadow-sm sm:p-6">
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+            <div className="space-y-1">
+              <h2 id="game-details-title" className="text-2xl font-semibold leading-tight text-zinc-900">
+                {data.identity.title ?? "Untitled game"}
+              </h2>
+              {primaryEntry?.status ? (
+                <p className="text-sm text-zinc-500">
+                  Library status <span className="font-medium text-zinc-700">{primaryEntry.status}</span>
+                </p>
               ) : null}
-            </span>
+            </div>
+            <div className="flex flex-wrap items-start gap-3">
+              <div className="h-28 w-20 overflow-hidden rounded border border-zinc-200 bg-zinc-100">
+                <GameCover identity={data.identity} size="md" />
+              </div>
+              {appid ? (
+                <div className="flex flex-col items-stretch gap-2 sm:flex-row sm:items-center">
+                  {primaryActionHref ? (
+                    <a
+                      href={primaryActionHref}
+                      className="btn rounded-full px-4 py-2 text-sm font-semibold"
+                      onClick={(event) => event.stopPropagation()}
+                    >
+                      {installed ? "Play" : "Install"}
+                    </a>
+                  ) : null}
+                  {steamStoreUrl ? (
+                    <a
+                      href={steamStoreUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="btn-ghost rounded-full px-4 py-2 text-sm font-semibold"
+                      onClick={(event) => event.stopPropagation()}
+                    >
+                      Open Store
+                    </a>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
+          </div>
+          {!rawgEnabled && (
+            <p className="mt-2 text-xs text-zinc-500">
+              RAWG integration is disabled. Media and critic data are limited to cached sources.
+            </p>
+          )}
+          <div className="mt-4 flex flex-wrap items-center gap-2">
+            {data.criticBadge ? <ScoreBadge badge={data.criticBadge} /> : null}
+            <TtbBadge ttb={data.ttb} />
+            {priceInfo ? (
+              <span className="inline-flex items-center gap-1 rounded-full border border-zinc-200 bg-zinc-100 px-2.5 py-1 text-xs font-semibold text-zinc-700">
+                Price {priceInfo.label}
+                {priceInfo.source === "steam" && priceInfo.discountPercent != null && priceInfo.discountPercent > 0 ? (
+                  <span className="ml-1 text-[11px] font-medium text-emerald-600">-{priceInfo.discountPercent}%</span>
+                ) : null}
+              </span>
+            ) : null}
+            {valuePerHour ? (
+              <span className="inline-flex items-center gap-1 rounded-full border border-zinc-200 bg-zinc-100 px-2.5 py-1 text-xs font-semibold text-zinc-700">
+                Value {valuePerHour}/h
+              </span>
+            ) : null}
+            {data.steamRefreshed ? (
+              <span className="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-600">
+                Steam data refreshed
+              </span>
+            ) : null}
+            {currentPlayersLabel ? (
+              <span className="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-600">
+                Players now {currentPlayersLabel}
+              </span>
+            ) : null}
+            {data.identity.platform ? (
+              <span className="inline-flex items-center rounded-full border border-zinc-200 bg-zinc-100 px-3 py-1 text-xs font-semibold text-zinc-700">
+                {data.identity.platform}
+              </span>
+            ) : null}
+            {genreHighlights.map((genre) => (
+              <span
+                key={genre}
+                className="rounded-full border border-zinc-200 bg-zinc-100 px-2.5 py-0.5 text-xs font-medium text-zinc-600"
+              >
+                {genre}
+              </span>
+            ))}
+          </div>
+          {releaseDisplay ? (
+            <p className="mt-3 text-xs uppercase tracking-[0.18em] text-emerald-500">Released {releaseDisplay}</p>
           ) : null}
-          {valuePerHour ? (
-            <span className="inline-flex items-center gap-1 rounded-full border border-zinc-200 bg-zinc-100 px-2.5 py-1 text-xs font-semibold text-zinc-700">
-              Value {valuePerHour}/h
-            </span>
-          ) : null}
-          {data.steamRefreshed ? (
-            <span className="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-600">
-              Steam data refreshed
-            </span>
-          ) : null}
-          {currentPlayersLabel ? (
-            <span className="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-600">
-              Players now {currentPlayersLabel}
-            </span>
-          ) : null}
-          {data.identity.platform ? (
-            <span className="inline-flex items-center rounded-full border border-zinc-200 bg-zinc-100 px-3 py-1 text-xs font-semibold text-zinc-700">
-              {data.identity.platform}
-            </span>
-          ) : null}
-          {genreHighlights.map((genre) => (
-            <span
-              key={genre}
-              className="rounded-full border border-zinc-200 bg-zinc-100 px-2.5 py-0.5 text-xs font-medium text-zinc-600"
-            >
-              {genre}
-            </span>
-          ))}
-        </div>
-        {releaseDisplay ? (
-          <p className="mt-3 text-xs uppercase tracking-[0.18em] text-emerald-500">Released {releaseDisplay}</p>
-        ) : null}
-      </section>
+        </section>
+      ) : null}
 
       <section className="rounded-3xl border border-zinc-200 bg-white p-4 shadow-sm sm:p-6">
         <h3 className="text-sm font-semibold text-zinc-800">Your data</h3>
@@ -1610,11 +1756,15 @@ export default function GameDetails({ identityId }: { identityId: string }) {
               </div>
               <div className="flex items-center justify-between">
                 <dt>Time to beat</dt>
-                <dd className="font-medium text-zinc-900">{data.ttb.value != null ? `${data.ttb.value}h` : "—"}</dd>
+                <dd className="font-medium text-zinc-900">{data.ttb.value != null ? `${data.ttb.value}h` : "-"}</dd>
+              </div>
+              <div className="flex items-center justify-between">
+                <dt>Critic score</dt>
+                <dd className="font-medium text-zinc-900">{criticSnapshotLabel}</dd>
               </div>
               <div className="flex items-center justify-between">
                 <dt>TTB source</dt>
-                <dd className="font-medium text-zinc-900">{data.ttb.sourceLabel ?? "—"}</dd>
+                <dd className="font-medium text-zinc-900">{data.ttb.sourceLabel ?? "-"}</dd>
               </div>
               <div className="flex items-center justify-between">
                 <dt>Purchase price</dt>
@@ -1653,6 +1803,12 @@ export default function GameDetails({ identityId }: { identityId: string }) {
                   <dt>Last played</dt>
                   <dd className="font-medium text-zinc-900">{steamStats.lastPlayed ?? "Not recorded"}</dd>
                 </div>
+                {currentPlayersLabel ? (
+                  <div className="flex items-center justify-between">
+                    <dt>Players now</dt>
+                    <dd className="font-medium text-zinc-900">{currentPlayersLabel}</dd>
+                  </div>
+                ) : null}
               </dl>
             ) : (
               <p className="mt-2 text-sm text-zinc-500">
@@ -1663,37 +1819,83 @@ export default function GameDetails({ identityId }: { identityId: string }) {
         </div>
       </section>
 
-      {finishPlan.length > 0 ? (
+      {hasPlan || previewSteps.length ? (
         <section className="rounded-2xl border border-emerald-200 bg-white p-4 shadow-inner">
           <div className="flex flex-wrap items-start justify-between gap-4">
             <div>
               <h3 className="text-xs font-semibold uppercase tracking-wide text-emerald-600">Finish planner</h3>
               <p className="mt-1 text-sm text-zinc-700">
-                Approximately {finishPlan.length} session{finishPlan.length === 1 ? "" : "s"} (~{totalPlanHours}h remaining) based
-                on your median session of {sessionMedian ?? "?"} minutes.
+                Approximately {planSessionsCount} session{planSessionsCount === 1 ? "" : "s"} (~{totalPlanHours}h remaining) based
+                on your median session of {sessionMedian > 0 ? sessionMedian : "?"} minutes.
               </p>
+              {planRow ? (
+                <p className="mt-1 text-xs font-medium text-emerald-600">
+                  Progress: {planCompletedCount} / {planSessionsCount} steps complete
+                </p>
+              ) : null}
             </div>
-            <button
-              type="button"
-              onClick={() => setPlanOpen((prev) => !prev)}
-              className="rounded-full border border-emerald-300 px-4 py-2 text-xs font-semibold text-emerald-600 hover:bg-emerald-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
-            >
-              {planOpen ? "Hide plan" : "View steps"}
-            </button>
+            <div className="flex items-center gap-2">
+              {planRow ? (
+                <button
+                  type="button"
+                  className="rounded-full border border-emerald-200 px-4 py-2 text-xs font-semibold text-emerald-600 hover:bg-emerald-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 disabled:opacity-60"
+                  onClick={handleRegeneratePlan}
+                  disabled={planSaving || !previewSteps.length}
+                >
+                  {planSaving ? "Rebuilding..." : "Refresh plan"}
+                </button>
+              ) : null}
+              <button
+                type="button"
+                onClick={handlePlanToggle}
+                disabled={planSaving}
+                className="rounded-full border border-emerald-300 px-4 py-2 text-xs font-semibold text-emerald-600 hover:bg-emerald-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 disabled:opacity-60"
+              >
+                {planSaving
+                  ? "Saving..."
+                  : planOpen
+                    ? "Hide plan"
+                    : planRow
+                      ? "View plan"
+                      : "Build plan"}
+              </button>
+            </div>
           </div>
+          {planError ? <p className="mt-2 text-sm text-rose-600">{planError}</p> : null}
           {planOpen ? (
             <ol className="mt-3 space-y-2 text-sm text-zinc-700">
-              {finishPlan.map((step, index) => {
+              {planSteps.map((step: PlanStep, index: number) => {
                 const dateLabel = step.dateSuggestion ? new Date(step.dateSuggestion).toLocaleDateString() : null;
+                const isDone = Boolean(step.done);
                 return (
                   <li
                     key={index}
                     className="flex items-center justify-between rounded-xl border border-emerald-100 bg-emerald-50/60 px-3 py-2"
                   >
-                    <span className="font-medium text-emerald-700">Session {index + 1}</span>
-                    <span className="text-emerald-600">
-                      {step.minutes} min{dateLabel ? ` · ${dateLabel}` : ""}
-                    </span>
+                    <div className="flex items-center gap-2">
+                      {planRow ? (
+                        <button
+                          type="button"
+                          onClick={() => handleTogglePlanStep(index)}
+                          disabled={planUpdatingIndex === index || planSaving}
+                          className={`flex h-6 w-6 items-center justify-center rounded-full border transition ${
+                            isDone ? "border-emerald-500 bg-emerald-500 text-white" : "border-emerald-300 bg-white text-emerald-500"
+                          }`}
+                          aria-pressed={isDone}
+                        >
+                          <span className="text-xs font-semibold">{isDone ? "Done" : index + 1}</span>
+                        </button>
+                      ) : (
+                        <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-emerald-100 text-xs font-semibold text-emerald-700">
+                          {index + 1}
+                        </span>
+                      )}
+                      <span className="font-medium text-emerald-700">Session {index + 1}</span>
+                    </div>
+                    <div className="flex items-center gap-3 text-emerald-600">
+                      <span>{step.minutes} min</span>
+                      {dateLabel ? <span className="text-xs text-emerald-500">~ {dateLabel}</span> : null}
+                    </div>
                   </li>
                 );
               })}
@@ -1701,7 +1903,6 @@ export default function GameDetails({ identityId }: { identityId: string }) {
           ) : null}
         </section>
       ) : null}
-
       <nav
         className="rounded-2xl border border-zinc-200 bg-white p-1 shadow-sm"
         role="tablist"
@@ -1768,6 +1969,10 @@ export default function GameDetails({ identityId }: { identityId: string }) {
     </div>
   );
 }
+
+
+
+
 
 
 

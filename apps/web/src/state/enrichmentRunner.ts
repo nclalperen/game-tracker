@@ -14,8 +14,8 @@ import {
 import { fetchHLTB, fetchOpenCriticScore, fetchSteamPrice, isTauri } from "@/desktop/bridge";
 import { lookupLocalHLTB } from "@/data/localDatasets";
 import { ensureRawgDetail } from "@/data/rawgCache";
-import { getMCEntry, loadMCIndex, mcKey, type MCEntry } from "@/data/metacriticIndex";
-import { normalizeTitleKey } from "@/utils/normalize";
+import { getMCEntry, loadMCIndex, type MCEntry } from "@/data/metacriticIndex";
+import { computeMcKeyAsync, normalizeTitleKeyAsync } from "@/workers/normalizeClient";
 import { useSyncExternalStore } from "react";
 import type { Identity } from "@tracker/core";
 
@@ -623,8 +623,8 @@ class EnrichmentRunner {
     if (!criticResolved && row.title) {
       try {
         await this.ensureMCIndex();
-        const key = mcKey(row.title, identityPlatform, undefined);
-        const mc = await getMCEntry(key);
+        const key = await computeMcKeyAsync(row.title, identityPlatform, undefined);
+        const mc = key ? await getMCEntry(key) : undefined;
         if (mc?.score != null && applyCriticScore(row, "metacritic", mc.score)) {
           criticResolved = row.mcScore != null && !Number.isNaN(row.mcScore);
           const updates: Partial<Identity> = {
@@ -783,7 +783,13 @@ class EnrichmentRunner {
       (row.ocScore != null && !Number.isNaN(row.ocScore));
 
     if (!criticResolved && isTauri) {
+      let normalizedOcKey: string | null | undefined = undefined;
       const oc = await this.tryWithRetries("oc", row, async () => {
+        if (normalizedOcKey === undefined) {
+          const normalized = await normalizeTitleKeyAsync(row.title);
+          normalizedOcKey = normalized ? normalized : null;
+        }
+        const norm = normalizedOcKey;
         try {
           const ident = await db.identities.get(row.identityId);
           if (ident?.ocScore != null && ident?.criticScoreSource === "opencritic") {
@@ -792,8 +798,7 @@ class EnrichmentRunner {
         } catch (_err) {
           // ignore
         }
-        const norm = normalizeTitleKey(row.title);
-        if (this.ocLRU.has(norm)) return this.ocLRU.get(norm)! as any;
+        if (norm && this.ocLRU.has(norm)) return this.ocLRU.get(norm)! as any;
         await this.awaitBudget("oc");
         return fetchOpenCriticScore(row.title);
       });
@@ -814,8 +819,12 @@ class EnrichmentRunner {
           } catch (_err) {
             // Ignore Dexie write errors.
           }
-          const norm = normalizeTitleKey(row.title);
-          if (row.ocScore != null) {
+          if (normalizedOcKey === undefined) {
+            const normalized = await normalizeTitleKeyAsync(row.title);
+            normalizedOcKey = normalized ? normalized : null;
+          }
+          const norm = normalizedOcKey;
+          if (row.ocScore != null && norm) {
             this.ocLRU.set(norm, row.ocScore);
             if (this.ocLRU.size > this.ocLRUMax) {
               const first = this.ocLRU.keys().next().value as string | undefined;
@@ -1197,6 +1206,3 @@ export function useEnrichmentRunner() {
 export function getEnrichmentRunner() {
   return runner;
 }
-
-
-
