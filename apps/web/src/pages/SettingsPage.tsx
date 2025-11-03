@@ -30,6 +30,8 @@ import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { getVersion } from "@tauri-apps/api/app";
 import { getConsoleBufferSnapshot } from "@/utils/consoleBuffer";
+import ThemeToggle from "@/components/ThemeToggle";
+import { useTheme, setTheme, type ThemeName } from "@/state/theme";
 
 const AllyDigestCard = lazy(() => import("@/components/AllyDigest"));
 type LocalDetect = import("@/desktop/localLlmBridge").LocalDetect;
@@ -190,6 +192,14 @@ export default function SettingsPage() {
   const [chatResponse, setChatResponse] = useState<{ content: string; isJson: boolean } | null>(null);
   const [localInfo, setLocalInfo] = useState<LocalDetect | null>(null);
   const [localChatState, setLocalChatState] = useState<StepState>(() => ({ status: "idle" }));
+  const theme = useTheme();
+  const themeButtonClass = (target: ThemeName) =>
+    [
+      "inline-flex items-center rounded-full border px-3 py-1 text-sm transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500",
+      theme === target
+        ? "border-emerald-300 bg-emerald-50 text-emerald-700 dark:border-emerald-500 dark:bg-emerald-900/40 dark:text-emerald-100"
+        : "border-zinc-200 bg-white text-zinc-600 hover:border-emerald-300 hover:text-emerald-600 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:border-emerald-400 dark:hover:text-emerald-300",
+    ].join(" ");
   const [localChatOutput, setLocalChatOutput] = useState<string | null>(null);
   const [localEmbedState, setLocalEmbedState] = useState<StepState>(() => ({ status: "idle" }));
   const [localEmbedSummary, setLocalEmbedSummary] = useState<string | null>(null);
@@ -1157,6 +1167,34 @@ export default function SettingsPage() {
   return (
     <div className="max-w-2xl space-y-6">
       <h1 className="text-2xl font-semibold">Settings</h1>
+
+      <section className="space-y-3">
+        <h2 className="text-lg font-medium">Appearance</h2>
+        <p className="text-sm text-zinc-600 dark:text-zinc-300">
+          Switch between day and night themes. Your preference is saved on this device.
+        </p>
+        <div className="flex flex-wrap items-center gap-3">
+          <ThemeToggle />
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              className={themeButtonClass("light")}
+              onClick={() => setTheme("light")}
+              aria-pressed={theme === "light"}
+            >
+              Day mode
+            </button>
+            <button
+              type="button"
+              className={themeButtonClass("dark")}
+              onClick={() => setTheme("dark")}
+              aria-pressed={theme === "dark"}
+            >
+              Night mode
+            </button>
+          </div>
+        </div>
+      </section>
 
       <section className="space-y-3">
         <h2 className="text-lg font-medium">Integrations</h2>

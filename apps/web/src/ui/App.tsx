@@ -1,8 +1,9 @@
-﻿import { useEffect } from "react";
+import { useEffect } from "react";
 import { Outlet, NavLink } from "react-router-dom";
 import { ensureSeed } from "@/utils/seed";
 import EnrichmentHUD from "@/overlays/EnrichmentHUD";
 import WishlistSyncHUD from "@/overlays/WishlistSyncHUD";
+import ThemeToggle from "@/components/ThemeToggle";
 import { initSessionBridge } from "@/desktop/sessionBridge";
 import { isTauri } from "@/desktop/bridge";
 import { startAllyAutomationLoop } from "@/ally/automation";
@@ -109,16 +110,20 @@ export default function App() {
       <EnrichmentHUD />
       <WishlistSyncHUD />
       <div className="max-w-6xl mx-auto p-4">
-        <nav className="flex gap-4 mb-4">
-          <NavLink to="/" end>Library</NavLink>
-          <NavLink to="/explore">Explore</NavLink>
-          <NavLink to="/wishlist">Wishlist</NavLink>
-          <NavLink to="/deals">Deals</NavLink>
-          <NavLink to="/suggestions">Suggestions</NavLink>
-          <NavLink to="/settings">Settings</NavLink>
+        <nav className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex flex-wrap items-center gap-3 text-sm font-medium">
+            <NavLink to="/" end>Library</NavLink>
+            <NavLink to="/explore">Explore</NavLink>
+            <NavLink to="/wishlist">Wishlist</NavLink>
+            <NavLink to="/deals">Deals</NavLink>
+            <NavLink to="/suggestions">Suggestions</NavLink>
+            <NavLink to="/settings">Settings</NavLink>
+          </div>
+          <ThemeToggle />
         </nav>
         <Outlet />
       </div>
     </>
   );
 }
+

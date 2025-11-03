@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { extractJsonBlock } from "../ally/repair";
+import { extractJsonBlock, extractJsonCandidates } from "../ally/repair";
 import { ZReply } from "../ally/schema";
 
 describe("extractJsonBlock", () => {
@@ -30,11 +30,32 @@ describe("ZReply", () => {
     expect(parsed.results[0].id).toBe("abc");
   });
 
-  it("throws for malformed reply", () => {
-    expect(() =>
-      ZReply.parse({
-        results: [{ id: "bad", rank: 1 }],
-      }),
-    ).toThrow();
+  it("coerces partial replies", () => {
+    const parsed = ZReply.parse({
+      results: [{ id: "bad", rank: "2", reason: "" }],
+    });
+    expect(parsed.results[0].rank).toBe(2);
+    expect(parsed.results[0].reason.length).toBeGreaterThan(0);
+  });
+});
+
+describe("extractJsonCandidates", () => {
+  it("returns fenced JSON blocks with newest last", () => {
+    const raw = `Prior text
+\`\`\`json
+{ "foo": "bar" }
+\`\`\`
+More commentary
+\`\`\`
+{ "hello": "world" }
+\`\`\`
+Trailing text`;
+    const candidates = extractJsonCandidates(raw);
+    expect(candidates).toEqual(['{ "foo": "bar" }', '{ "hello": "world" }']);
+  });
+
+  it("falls back to simple brace slice when no fences", () => {
+    const raw = "Noise { \"foo\": 1 } trailing";
+    expect(extractJsonCandidates(raw)).toEqual(['{ "foo": 1 }']);
   });
 });

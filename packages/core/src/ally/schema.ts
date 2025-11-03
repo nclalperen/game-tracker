@@ -1,9 +1,30 @@
 import { z } from "zod";
 
 export const ZResult = z.object({
-  id: z.string(),
-  rank: z.number().finite(),
-  reason: z.string().min(1),
+  id: z.string().min(1),
+  rank: z
+    .preprocess((value) => {
+      if (typeof value === "number") {
+        return value;
+      }
+      if (typeof value === "string") {
+        const numeric = Number.parseFloat(value.replace(/[^0-9.\-]+/g, ""));
+        if (Number.isFinite(numeric)) {
+          return numeric;
+        }
+      }
+      return Number.NaN;
+    }, z.number().finite())
+    .transform((value) => (value === 0 ? 1 : value)),
+  reason: z
+    .preprocess((value) => {
+      if (typeof value === "string") {
+        const trimmed = value.trim();
+        return trimmed.length === 0 ? "Recommendation provided without extra context." : trimmed;
+      }
+      return value;
+    }, z.string())
+    .default("Recommendation provided without extra context."),
 });
 
 export const ZChart = z.object({
