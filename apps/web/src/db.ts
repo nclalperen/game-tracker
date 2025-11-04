@@ -159,6 +159,9 @@ export type AllyTranscript = {
   allowWeb: boolean;
   query: string;
   reply: unknown;
+  rawText?: string;
+  warning?: string | null;
+  parseError?: string | null;
 };
 
 export type PlanStep = {
