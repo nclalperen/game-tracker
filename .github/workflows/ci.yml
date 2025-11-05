@@ -28,7 +28,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Ensure web workspace deps
-        run: pnpm -C apps/web install --frozen-lockfile --offline
+        run: pnpm -C apps/web install --frozen-lockfile
 
       - name: Install Playwright browsers
         run: pnpm -C apps/web dlx playwright install --with-deps
