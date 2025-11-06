@@ -30,6 +30,9 @@ jobs:
       - name: Ensure web workspace deps
         run: pnpm -C apps/web install --frozen-lockfile
 
+      - name: Link root dependencies into web workspace
+        run: pnpm -C apps/web link ..
+
       - name: Install Playwright browsers
         run: pnpm -C apps/web dlx playwright install --with-deps
 
