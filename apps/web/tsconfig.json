@@ -9,10 +9,7 @@
     },
     "types": [
       "vite/client",
-      "node",
-      "@tauri-apps/api",
-      "@tauri-apps/plugin-updater",
-      "@tauri-apps/plugin-process"
+      "node"
     ],
     "noEmit": true
   },
