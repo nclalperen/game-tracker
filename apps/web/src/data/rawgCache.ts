@@ -19,6 +19,8 @@ async function awaitBudget() {
   nextAllowedAt = Date.now() + RATE_LIMIT_MS;
 }
 
+let warnedMissingKey = false;
+
 export async function ensureRawgDetail(title: string): Promise<RawgGameCache | null> {
   const titleKey = normalizeTitle(title);
   if (!titleKey) return null;
@@ -91,7 +93,16 @@ export async function ensureRawgDetail(title: string): Promise<RawgGameCache | n
     await upsertRawgGame(cacheEntry);
     return cacheEntry;
   } catch (err) {
-    console.warn("RAWG detail lookup failed", err);
+    const msg = (err as Error)?.message || String(err);
+    // Avoid spamming the console when the RAWG key is missing; warn once.
+    if (msg.includes("RAWG API key") || msg.toLowerCase().includes("rawg") ) {
+      if (!warnedMissingKey) {
+        console.warn("RAWG detail lookup failed", msg);
+        warnedMissingKey = true;
+      }
+    } else {
+      console.warn("RAWG detail lookup failed", err);
+    }
     return cached ?? null;
   }
 }

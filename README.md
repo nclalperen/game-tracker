@@ -23,6 +23,12 @@ pnpm tauri build
 ```
 More detail in `docs/RELEASE.md`.
 
+Note: For RAWG-powered media in dev, create `apps/web/.env.local` with:
+
+```
+VITE_RAWG_KEY=your_rawg_api_key_here
+```
+
 ## QA
 See `docs/QA_SMOKE_0.1.0.md` for the smoke test matrix used for this release.
 

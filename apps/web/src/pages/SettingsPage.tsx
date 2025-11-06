@@ -193,6 +193,7 @@ export default function SettingsPage() {
   const [localInfo, setLocalInfo] = useState<LocalDetect | null>(null);
   const [localChatState, setLocalChatState] = useState<StepState>(() => ({ status: "idle" }));
   const theme = useTheme();
+  const rawgKeyPresent = Boolean((import.meta as any)?.env?.VITE_RAWG_KEY);
   const themeButtonClass = (target: ThemeName) =>
     [
       "inline-flex items-center rounded-full border px-3 py-1 text-sm transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500",
@@ -1232,6 +1233,11 @@ export default function SettingsPage() {
             />
             <span>RAWG metadata (covers, media, fallback scores)</span>
           </label>
+          {!rawgKeyPresent && (
+            <p className="pl-7 text-xs text-amber-600">
+              RAWG key missing. Add VITE_RAWG_KEY to apps/web/.env.local to enable online media.
+            </p>
+          )}
           <label className="flex items-center gap-3">
             <input
               type="checkbox"

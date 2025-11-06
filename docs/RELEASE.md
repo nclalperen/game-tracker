@@ -52,3 +52,16 @@ If you have a code-signing certificate, sign the MSI to avoid SmartScreen warnin
 git tag v0.1.0
 git push origin v0.1.0
 ```
+
+### Note on large model files (Git LFS)
+If your repo includes large `.gguf` models, ensure they are tracked by Git LFS and not embedded in Git history:
+
+```
+git lfs install
+git lfs track "*.gguf"
+git add .gitattributes
+# If the files were already committed without LFS, rewrite history:
+git lfs migrate import --include="*.gguf" --include-ref=refs/heads/main
+git push --force-with-lease
+```
+GitHub rejects files >100 MB unless stored via LFS pointers. Collaborators must also `git lfs install`.
