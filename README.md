@@ -3,9 +3,10 @@
 Open-source desktop + web app for tracking your PC game library, wishlist deals, and play sessions.
 
 ## Downloads
-- Latest Windows installer: `apps/desktop/src-tauri/target/release/bundle/msi/Game Tracker_0.1.0_x64_en-US.msi`
-  - **Note:** The MSI is unsigned in the open-source release. Windows SmartScreen will show “Unknown publisher.” Click “More info” → “Run anyway” to install.
-- macOS / Linux builds: run `pnpm tauri build --target …` on the respective platforms (see `docs/RELEASE.md`).
+- **Latest release (Windows / macOS / Linux):** https://github.com/nclalperen/game-tracker/releases/latest
+  - Windows MSI asset: Game Tracker_<version>_x64_en-US.msi (unsigned; SmartScreen will require "More info" ? "Run anyway").
+  - macOS (.dmg/.app) and Linux (.AppImage/.tar.gz) artifacts are uploaded automatically for each tag.
+- Prefer to build locally? Follow docs/RELEASE.md for platform-specific commands.
 
 ## Key Features
 - Steam library enrichment (covers, metadata, HLTB, RAWG).
@@ -63,3 +64,4 @@ See `docs/QA_SMOKE_0.1.0.md` for the smoke test matrix used for this release.
 - **Telemetry opt-in** – If we gather anonymous usage stats, ensure strict opt-in and privacy compliance.
 
 Roadmap items are aspirational; adjust priorities based on community feedback and contributor availability.
+
