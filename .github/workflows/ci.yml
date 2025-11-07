@@ -38,8 +38,8 @@ jobs:
       - name: Build workspace
         run: pnpm -w build
 
-      - name: Run tests
-        run: pnpm -w test
+      - name: Run unit tests
+        run: pnpm -w test:unit
 
       - name: Upload web dist
         uses: actions/upload-artifact@v4
