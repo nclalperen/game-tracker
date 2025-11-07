@@ -63,3 +63,7 @@ Open-source desktop + web app to track your PC game library, enrich metadata, pl
 **Contributing & License**
 - PRs and issues welcome. Please keep changes focused and documented.
 - License: MIT
+
+**Roadmap**
+- See docs/ROADMAP.md for near / mid / long-term plans.
+
