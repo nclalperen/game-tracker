@@ -5,8 +5,6 @@ import { fileURLToPath } from "node:url";
 const PORT = 5173;
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-const isCI = !!process.env.CI;
-
 export default defineConfig({
   testDir: "./tests",
   fullyParallel: true,
@@ -20,12 +18,10 @@ export default defineConfig({
     video: "retain-on-failure",
   },
   webServer: {
-    command: isCI
-      ? `pnpm preview -- --host 127.0.0.1 --port ${PORT} --strictPort`
-      : `pnpm dev -- --host 127.0.0.1 --port ${PORT} --strictPort`,
+    command: `pnpm dev -- --host 127.0.0.1 --port ${PORT} --strictPort`,
     cwd: __dirname,
     url: `http://127.0.0.1:${PORT}`,
-    reuseExistingServer: !isCI,
+    reuseExistingServer: !process.env.CI,
     timeout: 300_000,
   },
   projects: [
