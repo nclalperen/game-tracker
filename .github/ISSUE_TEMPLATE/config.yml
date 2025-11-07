@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security issue
+    url: https://github.com/nclalperen/game-tracker/security/policy
+    about: Please read our security policy before reporting vulnerabilities.

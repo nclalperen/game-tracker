@@ -1,0 +1,26 @@
+name: Feature request
+description: Suggest an idea or improvement
+labels: [enhancement]
+body:
+  - type: textarea
+    id: context
+    attributes:
+      label: What problem would this solve?
+      placeholder: Describe the user need or workflow
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      placeholder: Describe the feature and how it should work
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      placeholder: Any alternative solutions or workarounds?
+  - type: input
+    id: version
+    attributes:
+      label: Affected area
+      placeholder: web / desktop / core / docs

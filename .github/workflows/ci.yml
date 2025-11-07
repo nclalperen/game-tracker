@@ -1,12 +1,6 @@
 name: CI
 
-on:
-  push:
-    branches: ["main"]
-    tags: ["v*"]
-  pull_request:
-
-jobs:
+on:\n  schedule:\n    - cron: '0 3 * * *'\njobs:
   build-and-test:
     runs-on: ubuntu-latest
     permissions:
@@ -48,9 +42,9 @@ jobs:
           path: apps/web/dist
           if-no-files-found: warn
 
-  e2e-on-tags:
+  e2e-nightly:
     needs: build-and-test
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -79,7 +73,7 @@ jobs:
 
   tauri-release:
     needs: build-and-test
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'schedule'
     strategy:
       fail-fast: false
       matrix:
@@ -116,3 +110,5 @@ jobs:
           releaseName: Game Tracker ${{ github.ref_name }}
           releaseDraft: true
           includeDebug: false
+
+

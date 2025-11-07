@@ -1,3 +1,5 @@
+[![CI](https://github.com/nclalperen/game-tracker/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/nclalperen/game-tracker/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Release](https://img.shields.io/github/v/release/nclalperen/game-tracker)](https://github.com/nclalperen/game-tracker/releases/latest)
+
 # Game Tracker
 
 Open-source desktop + web app to track your PC game library, enrich metadata, plan play sessions, and spot great deals.
@@ -67,3 +69,18 @@ Open-source desktop + web app to track your PC game library, enrich metadata, pl
 **Roadmap**
 - See docs/ROADMAP.md for near / mid / long-term plans.
 
+
+
+**Screenshots**
+- Library
+  
+  ![Library](docs/images/library.png)
+- Deals
+  
+  ![Deals](docs/images/deals.png)
+- Inline Details
+  
+  ![Details](docs/images/details.png)
+
+**Architecture**
+- See `docs/ARCHITECTURE.md` for a system diagram and data flow.
