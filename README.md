@@ -6,13 +6,13 @@ Open-source desktop + web app to track your PC game library, enrich metadata, pl
 
 **Latest Release (Windows / macOS / Linux)**
 - https://github.com/nclalperen/game-tracker/releases/latest
-- Windows MSI is unsigned (open-source). SmartScreen: ìMore infoî ? ìRun anywayî.
+- Windows MSI is unsigned (open-source). SmartScreen: ‚ÄúMore info‚Äù ? ‚ÄúRun anyway‚Äù.
 
 **Monorepo Layout**
-- `apps/web` ó React + Vite + Dexie (IndexedDB)
-- `apps/desktop` ó Tauri v2 (Rust) shell for Windows/macOS/Linux
-- `packages/core` ó Shared logic (CSV, normalizers, scoring, types)
-- `docs` ó Release, QA, and dev docs
+- `apps/web` ‚Äî React + Vite + Dexie (IndexedDB)
+- `apps/desktop` ‚Äî Tauri v2 (Rust) shell for Windows/macOS/Linux
+- `packages/core` ‚Äî Shared logic (CSV, normalizers, scoring, types)
+- `docs` ‚Äî Release, QA, and dev docs
 
 **Features**
 - Library import (Steam + CSV) and robust wishlist sync (clear private/sign-in errors)
@@ -56,7 +56,7 @@ Open-source desktop + web app to track your PC game library, enrich metadata, pl
   - Metacritic (vendor index compiled from CSV; personal use)
   - Steam Web API (prices/news), OpenCritic (scores via desktop bridge)
 - Local LLM models (optional, via Git LFS): Llama-3.2-1B-Instruct, bge-base-en-v1.5. Use under their respective upstream licenses.
-- Each upstream project is governed by its own license and terms ó review before distribution or commercial use.
+- Each upstream project is governed by its own license and terms ‚Äî review before distribution or commercial use.
 
 **Privacy & Terms**
 - This app is for personal library management. Respect third-party terms for RAWG/HLTB/Metacritic/Steam/OpenCritic.
@@ -75,9 +75,9 @@ Open-source desktop + web app to track your PC game library, enrich metadata, pl
 - Library
   
   ![Library](docs/images/library.png)
-- Deals
+- Explore
   
-  ![Deals](docs/images/deals.png)
+  ![Explore](docs/images/explore.png)
 - Inline Details
   
   ![Details](docs/images/details.png)
