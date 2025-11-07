@@ -1,67 +1,65 @@
 # Game Tracker
 
-Open-source desktop + web app for tracking your PC game library, wishlist deals, and play sessions.
+Open-source desktop + web app to track your PC game library, enrich metadata, plan play sessions, and spot great deals.
 
-## Downloads
-- **Latest release (Windows / macOS / Linux):** https://github.com/nclalperen/game-tracker/releases/latest
-  - Windows MSI asset: Game Tracker_<version>_x64_en-US.msi (unsigned; SmartScreen will require "More info" ? "Run anyway").
-  - macOS (.dmg/.app) and Linux (.AppImage/.tar.gz) artifacts are uploaded automatically for each tag.
-- Prefer to build locally? Follow docs/RELEASE.md for platform-specific commands.
+**Latest Release (Windows / macOS / Linux)**
+- https://github.com/nclalperen/game-tracker/releases/latest
+- Windows MSI is unsigned (open-source). SmartScreen: ìMore infoî ? ìRun anywayî.
 
-## Key Features
-- Steam library enrichment (covers, metadata, HLTB, RAWG).
-- Wishlist sync with error handling for private/sign-in/HTML responses.
-- Deal scoring with wishlist toggles and owned-title filtering.
-- AI-backed suggestions with strict JSON pipeline and offline heuristics.
-- Dark/light theme toggle.
+**Monorepo Layout**
+- `apps/web` ó React + Vite + Dexie (IndexedDB)
+- `apps/desktop` ó Tauri v2 (Rust) shell for Windows/macOS/Linux
+- `packages/core` ó Shared logic (CSV, normalizers, scoring, types)
+- `docs` ó Release, QA, and dev docs
 
-## Building from Source
-```bash
-pnpm -w install
-pnpm -C apps/web build
-# Windows desktop bundle
-pnpm tauri build
-```
-More detail in `docs/RELEASE.md`.
+**Features**
+- Library import (Steam + CSV) and robust wishlist sync (clear private/sign-in errors)
+- Enrichment with strict precedence:
+  - Covers: Steam ? RAWG ? IGDB ? placeholder
+  - Time-to-beat: HLTB vendor ? HLTB live ? RAWG avg
+  - Scores: Metacritic vendor ? OpenCritic ? RAWG aggregated
+- Inline card details (expand in place), keyboard accessible (Enter/Space)
+- Deals page (owned titles hidden by default), AI suggestions, dark mode
+- Windows session logger (now playing + session history)
 
-Note: For RAWG-powered media in dev, create `apps/web/.env.local` with:
+**Quick Start**
+- Requirements: Node 20+, pnpm 10+, Git LFS; Rust (for desktop builds)
+- Install: `pnpm -w install`
+- Dev (web): `pnpm -C apps/web dev`
+- Dev (desktop): `pnpm -C apps/desktop tauri dev`
+- Build (web): `pnpm -C apps/web build`
+- Bundle (desktop): `pnpm desktop:bundle`
 
-```
-VITE_RAWG_KEY=your_rawg_api_key_here
-```
+**Environment & Settings**
+- RAWG media: create `apps/web/.env.local` with `VITE_RAWG_KEY=...` (see `.env.example` files)
+- Steam region/language and vendor toggles are configurable in Settings
+- Large model files are tracked via Git LFS (see `docs/RELEASE.md`)
 
-## QA
-See `docs/QA_SMOKE_0.1.0.md` for the smoke test matrix used for this release.
+**Tests**
+- Unit: `pnpm -w test`
+- E2E (local):
+  - `pnpm -C apps/web exec playwright install --with-deps`
+  - `pnpm -C apps/web test:e2e`
 
-# Roadmap
+**Releases**
+- Tag `vX.Y.Z` to build cross-platform bundles in CI
+- Notes: `docs/RELEASE_NOTES_*.md` (e.g., 0.1.0, 0.1.1)
+- Checklist & signing guidance: `docs/RELEASE.md`, `docs/CODE_SIGNING.md`
 
-## Short Term (0.1.x)
-- **macOS & Linux bundles** ‚Äì Add CI jobs (or manual scripts) to produce `.dmg` / `.AppImage` alongside the Windows MSI. Update release automation to upload all three.
-- **Optional code signing** ‚Äì Evaluate purchasing an org code-sign cert. Integrate signing step (signtool + notarisation) into release script when available.
-- **Install/onboarding improvements**
-  - Warn first-run users about unsigned installer & how to bypass SmartScreen.
-  - Offer direct download instructions for LLM/Ally models if the bundle is trimmed.
-- **AI tuning**
-  - Add caching to strict JSON retries to reduce repeated network calls.
-  - Surface Ally transcript excerpts directly on the Suggestions page.
-- **Wishlist UX**
-  - Provide link to Steam privacy settings when import fails.
-  - Add ‚ÄúRetry‚Äù button on the wishlist HUD.
+**Open-Source Assets & Third-Party**
+- Libraries: React, Vite, Dexie, Tauri, TailwindCSS, Playwright, DOMPurify, TanStack Virtual
+- APIs / Datasets:
+  - RAWG API (covers/media; https://rawg.io/apidocs)
+  - HowLongToBeat (TTB; local dataset + optional live lookup)
+  - Metacritic (vendor index compiled from CSV; personal use)
+  - Steam Web API (prices/news), OpenCritic (scores via desktop bridge)
+- Local LLM models (optional, via Git LFS): Llama-3.2-1B-Instruct, bge-base-en-v1.5. Use under their respective upstream licenses.
+- Each upstream project is governed by its own license and terms ó review before distribution or commercial use.
 
-## Mid Term (0.2)
-- **Cloud sync options** ‚Äì Research integration with Google Drive/Dropbox or a simple WebDAV exporter for session data and enrichment caches.
-- **Session analytics** ‚Äì Desktop overlay (or mini dashboard) showing recent play sessions and completion status.
-- **Deal alerts** ‚Äì Background notifications when wishlist items fall below a target price.
-- **AI suggestions**
-  - Allow prompt templates per mode (coach/deals/QA) configurable in Settings.
-  - Experiment with local LLM fallback when offline.
-- **Chunk size reduction** ‚Äì Split heavy bundles (RAWG, Dexie) into lazy chunks to shrink initial app load.
+**Privacy & Terms**
+- This app is for personal library management. Respect third-party terms for RAWG/HLTB/Metacritic/Steam/OpenCritic.
+- Do not commit private API keys. Use `.env.local` for local development.
 
-## Later (0.3+)
-- **Cross-store integrations** ‚Äì Investigate Epic/GOG/PlayStation importers.
-- **Mobile companion** ‚Äì Concepts for a lightweight React Native client consuming a shared Dexie/exported database.
-- **Plugin system** ‚Äì Define API for community enrichment providers.
-- **Telemetry opt-in** ‚Äì If we gather anonymous usage stats, ensure strict opt-in and privacy compliance.
-
-Roadmap items are aspirational; adjust priorities based on community feedback and contributor availability.
-
+**Contributing & License**
+- PRs and issues welcome. Please keep changes focused and documented.
+- License: MIT
